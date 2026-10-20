@@ -63,7 +63,6 @@ from PySide6.QtGui import (
 )
 from PySide6.QtTextToSpeech import QTextToSpeech
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -80,6 +79,7 @@ from qt_property_widgets.utilities import (
     property_params,
 )
 from qt_property_widgets.widgets import (
+    BoolWidget,
     ColorWidget,
     Expander,
     PropertyForm,
@@ -772,18 +772,25 @@ class CollapsibleGroupWidget(PropertyWidget):
         super().on_bind(instance)
         enable_prop = self.source_params.get("enable_prop")
         if enable_prop and hasattr(instance, enable_prop):
-            self.checkbox = QCheckBox()
-            self.checkbox.setChecked(bool(getattr(instance, enable_prop)))
-            self.checkbox.toggled.connect(
+            self.bool_widget = BoolWidget()
+            self.bool_widget.spacer.setVisible(False)
+            self.bool_widget.value = bool(getattr(instance, enable_prop))
+            self.bool_widget.value_changed.connect(
                 lambda val: setattr(instance, enable_prop, val)
             )
             if hasattr(instance, "changed") and hasattr(instance.changed, "connect"):
                 instance.changed.connect(
-                    lambda: self.checkbox.setChecked(bool(getattr(instance, enable_prop)))
-                    if hasattr(self, "checkbox") and self.checkbox.isChecked() != bool(getattr(instance, enable_prop))
+                    lambda: setattr(
+                        self.bool_widget,
+                        "value",
+                        bool(getattr(instance, enable_prop)),
+                    )
+                    if hasattr(self, "bool_widget")
+                    and self.bool_widget.value
+                    != bool(getattr(instance, enable_prop))
                     else None
                 )
-            self.expander.controls_layout.addWidget(self.checkbox)
+            self.expander.controls_layout.addWidget(self.bool_widget)
 
     @property
     def value(self) -> object:
