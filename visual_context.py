@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
 )
 from qt_property_widgets.utilities import (
@@ -801,6 +802,216 @@ class CollapsibleGroupWidget(PropertyWidget):
         self.form.value = v
 
 
+class EditPromptWidget(PropertyWidget):
+    """Button row that opens the prompt editor dialog."""
+
+    value_changed = Signal(object)
+
+    @staticmethod
+    def from_property_impl(prop: property) -> "EditPromptWidget":
+        return EditPromptWidget()
+
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addStretch(1)
+
+        self.button = QToolButton()
+        self.button.setIcon(QIcon.fromTheme("accessories-text-editor"))
+        self.button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.button.setObjectName("HeaderAction")
+        layout.addWidget(self.button)
+
+        self.grid_layout.addLayout(layout, 0, 0)
+        self.button.clicked.connect(self._on_clicked)
+
+    def on_bind(self, instance: Any) -> None:
+        super().on_bind(instance)
+        self._target_instance = instance
+
+    def _on_clicked(self) -> None:
+        if hasattr(self, "_target_instance") and hasattr(
+            self._target_instance, "open_prompt_editor"
+        ):
+            self._target_instance.open_prompt_editor()
+
+    @property
+    def value(self) -> Any:
+        return None
+
+    @value.setter
+    def value(self, v: Any) -> None:
+        pass
+
+
+class CaptioningSettings(PersistentPropertiesMixin, QObject):
+    """VLM captioning generation and prompt settings."""
+
+    changed = Signal()
+
+    def __init__(
+        self,
+        prompt: str = DEFAULT_PROMPT,
+        max_tokens: int = 64,
+        interval_s: float = 2.0,
+        skip_similar: bool = True,
+        similarity_threshold: float = 6.0,
+    ) -> None:
+        super().__init__()
+        self._prompt = prompt
+        self._max_tokens = max_tokens
+        self._interval_s = interval_s
+        self._skip_similar = skip_similar
+        self._similarity_threshold = similarity_threshold
+
+    @property
+    @property_params(label="Prompt Template")
+    def prompt_template(self) -> PromptTemplate:
+        current = self._prompt.strip()
+        for t in PromptTemplate:
+            if t == PromptTemplate.Custom:
+                continue
+            if current == PROMPT_TEMPLATES.get(t.value, "").strip():
+                return t
+        return PromptTemplate.Custom
+
+    @prompt_template.setter
+    def prompt_template(self, v: PromptTemplate | str) -> None:
+        if isinstance(v, str):
+            v = PromptTemplate(v)
+        if v != PromptTemplate.Custom:
+            self.prompt = PROMPT_TEMPLATES[v.value]
+        self.changed.emit()
+
+    @property
+    @property_params(label="Captioning Prompt")
+    def prompt(self) -> str:
+        return self._prompt
+
+    @prompt.setter
+    def prompt(self, v: str) -> None:
+        text = str(v).strip()
+        self._prompt = text or DEFAULT_PROMPT
+        self.changed.emit()
+
+    @property
+    @property_params(label="Edit Prompt", widget=EditPromptWidget, dont_encode=True)
+    def edit_prompt(self) -> None:
+        return None
+
+    @edit_prompt.setter
+    def edit_prompt(self, v: Any) -> None:
+        pass
+
+    @property
+    @property_params(label="Max Tokens per Caption", min=16, max=256)
+    def max_tokens(self) -> int:
+        return self._max_tokens
+
+    @max_tokens.setter
+    def max_tokens(self, v: int) -> None:
+        self._max_tokens = min(max(int(v), 16), 256)
+        self.changed.emit()
+
+    @property
+    @property_params(label="Seconds Between Captions", min=0.2, max=60.0)
+    def interval_s(self) -> float:
+        return self._interval_s
+
+    @interval_s.setter
+    def interval_s(self, v: float) -> None:
+        value = float(v)
+        self._interval_s = 2.0 if math.isnan(value) else min(max(value, 0.2), 60.0)
+        self.changed.emit()
+
+    @property
+    @property_params(label="Skip Near-Identical Frames")
+    def skip_similar(self) -> bool:
+        return self._skip_similar
+
+    @skip_similar.setter
+    def skip_similar(self, v: bool) -> None:
+        self._skip_similar = bool(v)
+        self.changed.emit()
+
+    @property
+    @property_params(label="Frame Difference Threshold", min=0.0, max=64.0)
+    def similarity_threshold(self) -> float:
+        return self._similarity_threshold
+
+    @similarity_threshold.setter
+    def similarity_threshold(self, v: float) -> None:
+        value = float(v)
+        self._similarity_threshold = (
+            6.0 if math.isnan(value) else min(max(value, 0.0), 64.0)
+        )
+        self.changed.emit()
+
+    def open_prompt_editor(self) -> None:
+        """Edit Captioning Prompt in a dialog."""
+        dialog = QDialog()
+        dialog.setWindowTitle("Captioning Prompt")
+        dialog.resize(500, 300)
+
+        layout = QVBoxLayout(dialog)
+
+        tmpl_layout = QHBoxLayout()
+        tmpl_layout.addWidget(QLabel("Template:"))
+        combo = QComboBox()
+        combo.addItems(list(PROMPT_TEMPLATES.keys()))
+        combo.addItem("Custom")
+
+        current = self._prompt.strip()
+        matched_tmpl = "Custom"
+        for k, v in PROMPT_TEMPLATES.items():
+            if current == v.strip():
+                matched_tmpl = k
+                break
+        combo.setCurrentText(matched_tmpl)
+        tmpl_layout.addWidget(combo)
+        layout.addLayout(tmpl_layout)
+
+        layout.addWidget(QLabel("Prompt sent to the VLM for every frame:"))
+
+        text_edit = QTextEdit()
+        text_edit.setPlainText(self._prompt)
+        layout.addWidget(text_edit)
+
+        def on_combo_changed(text: str) -> None:
+            if text in PROMPT_TEMPLATES:
+                text_edit.setPlainText(PROMPT_TEMPLATES[text])
+
+        combo.currentTextChanged.connect(on_combo_changed)
+
+        def on_text_changed() -> None:
+            current_text = text_edit.toPlainText().strip()
+            matched = False
+            for k, v in PROMPT_TEMPLATES.items():
+                if current_text == v.strip():
+                    combo.setCurrentText(k)
+                    matched = True
+                    break
+            if not matched:
+                combo.setCurrentText("Custom")
+
+        text_edit.textChanged.connect(on_text_changed)
+
+        buttons_layout = QHBoxLayout()
+        btn_ok = QPushButton("OK")
+        btn_cancel = QPushButton("Cancel")
+        btn_ok.clicked.connect(dialog.accept)
+        btn_cancel.clicked.connect(dialog.reject)
+        buttons_layout.addWidget(btn_cancel)
+        buttons_layout.addWidget(btn_ok)
+        layout.addLayout(buttons_layout)
+
+        if dialog.exec():
+            text = text_edit.toPlainText().strip()
+            if text:
+                self.prompt = text
+
+
 class VisualContextPlugin(Plugin):
     label = "Visual Context (Scene Captioning)"
 
@@ -814,11 +1025,8 @@ class VisualContextPlugin(Plugin):
         # switched on") -- the caption overlay toggle must not reuse it.
         self._show_captions = True
         self._model = CaptionModel.Balanced_4B
-        self._interval_s = 2.0
-        self._prompt = DEFAULT_PROMPT
-        self._max_tokens = 64
-        self._skip_similar = True
-        self._similarity_threshold = 6.0
+        self._settings = CaptioningSettings()
+        self._settings.changed.connect(self.changed.emit)
 
         self._caption_style = CaptionStyle()
         self._caption_style.changed.connect(self.changed.emit)
@@ -966,82 +1174,77 @@ class VisualContextPlugin(Plugin):
         self.changed.emit()
 
     @property
-    @property_params(label="Seconds Between Captions", min=0.2, max=60.0)
-    def interval_s(self) -> float:
-        return self._interval_s
+    @property_params(
+        primary=True,
+        widget=CollapsibleGroupWidget,
+        label="Settings",
+    )
+    def settings(self) -> CaptioningSettings:
+        return self._settings
 
-    @interval_s.setter
-    def interval_s(self, v: float) -> None:
-        # The min/max above are UI hints only; clamp for real so no caller can
-        # ask for an interval that would allocate an absurd sampling array.
-        value = float(v)
-        self._interval_s = 2.0 if math.isnan(value) else min(max(value, 0.2), 60.0)
+    @settings.setter
+    def settings(self, value: CaptioningSettings | dict) -> None:
+        if isinstance(value, dict):
+            self._settings.__setstate__(value)
+        elif isinstance(value, CaptioningSettings):
+            self._settings = value
+            self._settings.changed.connect(self.changed.emit)
         self.changed.emit()
 
+    # Backward compatibility proxies
     @property
-    @property_params(label="Max Tokens per Caption", min=16, max=256)
-    def max_tokens(self) -> int:
-        return self._max_tokens
-
-    @max_tokens.setter
-    def max_tokens(self, v: int) -> None:
-        self._max_tokens = min(max(int(v), 16), 256)
-        self.changed.emit()
-
-    @property
-    @property_params(label="Prompt Template")
+    @property_params(widget=None, dont_encode=True)
     def prompt_template(self) -> PromptTemplate:
-        current = self._prompt.strip()
-        for t in PromptTemplate:
-            if t == PromptTemplate.Custom:
-                continue
-            # Use the enum value to lookup in PROMPT_TEMPLATES
-            if current == PROMPT_TEMPLATES.get(t.value, "").strip():
-                return t
-        return PromptTemplate.Custom
+        return self._settings.prompt_template
 
     @prompt_template.setter
-    def prompt_template(self, v: PromptTemplate) -> None:
-        if v != PromptTemplate.Custom:
-            self.prompt = PROMPT_TEMPLATES[v.value]
-        self.changed.emit()
+    def prompt_template(self, v: PromptTemplate | str) -> None:
+        self._settings.prompt_template = v
 
     @property
-    @property_params(label="Captioning Prompt")
+    @property_params(widget=None, dont_encode=True)
     def prompt(self) -> str:
-        return self._prompt
+        return self._settings.prompt
 
     @prompt.setter
     def prompt(self, v: str) -> None:
-        # Must be a real property: background actions run in a separate
-        # process that rebuilds this plugin from its serialized properties,
-        # so a plain attribute would never reach the captioning job.
-        text = str(v).strip()
-        self._prompt = text or DEFAULT_PROMPT
-        self.changed.emit()
+        self._settings.prompt = v
 
     @property
-    @property_params(label="Skip Near-Identical Frames")
+    @property_params(widget=None, dont_encode=True)
+    def max_tokens(self) -> int:
+        return self._settings.max_tokens
+
+    @max_tokens.setter
+    def max_tokens(self, v: int) -> None:
+        self._settings.max_tokens = v
+
+    @property
+    @property_params(widget=None, dont_encode=True)
+    def interval_s(self) -> float:
+        return self._settings.interval_s
+
+    @interval_s.setter
+    def interval_s(self, v: float) -> None:
+        self._settings.interval_s = v
+
+    @property
+    @property_params(widget=None, dont_encode=True)
     def skip_similar(self) -> bool:
-        return self._skip_similar
+        return self._settings.skip_similar
 
     @skip_similar.setter
     def skip_similar(self, v: bool) -> None:
-        self._skip_similar = bool(v)
-        self.changed.emit()
+        self._settings.skip_similar = v
 
     @property
-    @property_params(label="Frame Difference Threshold", min=0.0, max=64.0)
+    @property_params(widget=None, dont_encode=True)
     def similarity_threshold(self) -> float:
-        return self._similarity_threshold
+        return self._settings.similarity_threshold
 
     @similarity_threshold.setter
     def similarity_threshold(self, v: float) -> None:
-        value = float(v)
-        self._similarity_threshold = (
-            6.0 if math.isnan(value) else min(max(value, 0.0), 64.0)
-        )
-        self.changed.emit()
+        self._settings.similarity_threshold = v
 
     # Backward compatibility proxies
     @property
@@ -1094,72 +1297,9 @@ class VisualContextPlugin(Plugin):
     # Actions
     # ------------------------------------------------------------------
 
-    @action
-    @action_params(compact=True, icon=QIcon.fromTheme("accessories-text-editor"))
     def edit_prompt(self) -> None:
-        """Edit Captioning Prompt"""
-        dialog = QDialog()
-        dialog.setWindowTitle("Captioning Prompt")
-        dialog.resize(500, 300)
-        
-        layout = QVBoxLayout(dialog)
-        
-        # Template selection
-        tmpl_layout = QHBoxLayout()
-        tmpl_layout.addWidget(QLabel("Template:"))
-        combo = QComboBox()
-        combo.addItems(list(PROMPT_TEMPLATES.keys()))
-        combo.addItem("Custom")
-        
-        # Determine initial selection based on current prompt
-        current = self._prompt.strip()
-        matched_tmpl = "Custom"
-        for k, v in PROMPT_TEMPLATES.items():
-            if current == v.strip():
-                matched_tmpl = k
-                break
-        combo.setCurrentText(matched_tmpl)
-        tmpl_layout.addWidget(combo)
-        layout.addLayout(tmpl_layout)
-        
-        layout.addWidget(QLabel("Prompt sent to the VLM for every frame:"))
-        
-        text_edit = QTextEdit()
-        text_edit.setPlainText(self._prompt)
-        layout.addWidget(text_edit)
-        
-        # Update text edit when combo changes
-        def on_combo_changed(text):
-            if text in PROMPT_TEMPLATES:
-                text_edit.setPlainText(PROMPT_TEMPLATES[text])
-        combo.currentTextChanged.connect(on_combo_changed)
-        
-        # Check if user modifies text, change combo to "Custom"
-        def on_text_changed():
-            current_text = text_edit.toPlainText().strip()
-            matched = False
-            for k, v in PROMPT_TEMPLATES.items():
-                if current_text == v.strip():
-                    combo.setCurrentText(k)
-                    matched = True
-                    break
-            if not matched:
-                combo.setCurrentText("Custom")
-        text_edit.textChanged.connect(on_text_changed)
-        
-        buttons_layout = QHBoxLayout()
-        btn_ok = QPushButton("OK")
-        btn_cancel = QPushButton("Cancel")
-        btn_ok.clicked.connect(dialog.accept)
-        btn_cancel.clicked.connect(dialog.reject)
-        buttons_layout.addWidget(btn_cancel)
-        buttons_layout.addWidget(btn_ok)
-        layout.addLayout(buttons_layout)
-        
-        if dialog.exec():
-            text = text_edit.toPlainText().strip()
-            if text:
-                self.prompt = text
+        """Edit Captioning Prompt (opens dialog)."""
+        self._settings.open_prompt_editor()
 
     @action
     @action_params(compact=True, icon=QIcon.fromTheme("media-playback-start"))
@@ -1321,7 +1461,7 @@ class VisualContextPlugin(Plugin):
         if reference_thumb is None or not reference_text:
             return None
         difference = float(np.mean(np.abs(thumb - reference_thumb)))
-        if difference < self._similarity_threshold:
+        if difference < self.similarity_threshold:
             return reference_text
         return None
 
@@ -1354,12 +1494,12 @@ class VisualContextPlugin(Plugin):
             raise RuntimeError("This recording has no scene video to caption")
 
         times_ns = np.asarray(scene.time)
-        indices = _sample_indices(times_ns, self._interval_s)
+        indices = _sample_indices(times_ns, self.interval_s)
         if not indices:
             self._record_failure("Could not select any scene frames to caption.")
             raise RuntimeError("Could not select any scene frames to caption")
 
-        captioner = _Captioner(self._model, self._max_tokens)
+        captioner = _Captioner(self._model, self.max_tokens)
         total = len(indices)
 
         try:
@@ -1386,7 +1526,7 @@ class VisualContextPlugin(Plugin):
 
                 thumb: np.ndarray | None = None
                 text: str | None = None
-                if self._skip_similar:
+                if self.skip_similar:
                     thumb = _thumbnail(image)
                     text = self._reuse_caption(thumb, reference_thumb, reference_text)
                     reused += text is not None
@@ -1406,7 +1546,7 @@ class VisualContextPlugin(Plugin):
                                 gaze_y = float(np.asarray(gaze["point_y"])[idx])
 
                         # Inject variables using string replace
-                        current_prompt = self._prompt
+                        current_prompt = self.prompt
                         current_prompt = current_prompt.replace("{gaze_x}", f"{gaze_x:.1f}" if isinstance(gaze_x, float) else gaze_x)
                         current_prompt = current_prompt.replace("{gaze_y}", f"{gaze_y:.1f}" if isinstance(gaze_y, float) else gaze_y)
                         current_prompt = current_prompt.replace("{width}", str(image.width))
@@ -1456,8 +1596,8 @@ class VisualContextPlugin(Plugin):
                     "recording_start_time": self.recording.start_time,
                     "model": captioner.repo,
                     "backend": captioner.backend,
-                    "prompt": self._prompt,
-                    "interval_s": self._interval_s,
+                    "prompt": self.prompt,
+                    "interval_s": self.interval_s,
                     "captions": captions,
                     "total_time_s": time.time() - t_start,
                 },
