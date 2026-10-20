@@ -50,6 +50,7 @@ from pupil_labs.neon_player import Plugin, ProgressUpdate, action
 from pupil_labs.neon_player.plugins.events import EventsPlugin
 from PySide6.QtCore import QRect, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen
+from PySide6.QtTextToSpeech import QTextToSpeech
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -546,6 +547,14 @@ class VisualContextPlugin(Plugin):
         self._text_color = QColor("#FFFFFF")
         self._bg_color = QColor(0, 0, 0, 160)
 
+        self._narrate_captions = False
+        self._last_narrated_ns = -1
+        try:
+            self._tts = QTextToSpeech()
+        except Exception as e:
+            logger.error(f"Failed to initialize TTS: {e}")
+            self._tts = None
+
     # ------------------------------------------------------------------
     # Cache handling
     # ------------------------------------------------------------------
@@ -636,6 +645,18 @@ class VisualContextPlugin(Plugin):
     @show_captions.setter
     def show_captions(self, v: bool) -> None:
         self._show_captions = bool(v)
+        self.changed.emit()
+
+    @property
+    @property_params(label="Narrate Captions (TTS)")
+    def narrate_captions(self) -> bool:
+        return self._narrate_captions
+
+    @narrate_captions.setter
+    def narrate_captions(self, v: bool) -> None:
+        self._narrate_captions = bool(v)
+        if not self._narrate_captions and getattr(self, "_tts", None):
+            self._tts.stop()
         self.changed.emit()
 
     @property
@@ -1154,11 +1175,19 @@ class VisualContextPlugin(Plugin):
 
         caption = self._caption_at(time_in_recording)
         if caption is None:
+            self._last_narrated_ns = -1
             return
 
         text = caption["text"].strip()
         if not text:
             return
+
+        # Trigger TTS if a new caption appears
+        if getattr(self, "_narrate_captions", False) and getattr(self, "_tts", None):
+            if caption["start_ns"] != self._last_narrated_ns:
+                self._last_narrated_ns = caption["start_ns"]
+                self._tts.stop() # Interrupt previous speech
+                self._tts.say(text)
 
         scene_width = self.recording.scene.width
         scene_height = self.recording.scene.height
