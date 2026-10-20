@@ -48,7 +48,7 @@ import numpy as np
 from PIL import Image
 from pupil_labs.neon_player import Plugin, ProgressUpdate, action
 from pupil_labs.neon_player.plugins.events import EventsPlugin
-from PySide6.QtCore import QRect, QRectF, Qt
+from PySide6.QtCore import QObject, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen
 from PySide6.QtTextToSpeech import QTextToSpeech
 from PySide6.QtWidgets import (
@@ -62,7 +62,12 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
 )
-from qt_property_widgets.utilities import action_params, property_params
+from qt_property_widgets.utilities import (
+    PersistentPropertiesMixin,
+    action_params,
+    property_params,
+)
+from qt_property_widgets.widgets import Expander, PropertyForm, PropertyWidget
 
 logger = logging.getLogger(__name__)
 
@@ -524,6 +529,84 @@ class _Captioner:
                 logger.debug("Could not clear the MLX cache", exc_info=True)
 
 
+class CaptionStyle(PersistentPropertiesMixin, QObject):
+    """Caption appearance and style settings."""
+
+    changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._font_size = 26
+        self._text_color = QColor("#FFFFFF")
+
+    @property
+    @property_params(label="Font Size", min=10, max=100)
+    def font_size(self) -> int:
+        """Caption Font Size"""
+        return self._font_size
+
+    @font_size.setter
+    def font_size(self, v: int) -> None:
+        self._font_size = min(max(int(v), 10), 100)
+        self.changed.emit()
+
+    @property
+    @property_params(label="Text Color")
+    def text_color(self) -> QColor:
+        """Caption Text Color"""
+        return self._text_color
+
+    @text_color.setter
+    def text_color(self, v: QColor) -> None:
+        self._text_color = QColor(v)
+        self.changed.emit()
+
+
+class CollapsibleGroupWidget(PropertyWidget):
+    """Renders a custom type inside a collapsible Expander section."""
+
+    value_changed = Signal(object)
+
+    @staticmethod
+    def from_property_impl(prop: property) -> "CollapsibleGroupWidget":
+        target_type = None
+        if hasattr(prop, "fget") and prop.fget:
+            try:
+                import typing as T
+                target_type = T.get_type_hints(prop.fget).get("return")
+            except Exception:
+                pass
+            if target_type is None or isinstance(target_type, str):
+                hints = getattr(prop.fget, "__annotations__", {})
+                ret = hints.get("return")
+                if isinstance(ret, type):
+                    target_type = ret
+                elif isinstance(ret, str) and hasattr(prop.fget, "__globals__"):
+                    target_type = prop.fget.__globals__.get(ret, object)
+        if target_type is None or not isinstance(target_type, type):
+            target_type = object
+
+        params = getattr(prop.fget, "parameters", {}) if hasattr(prop, "fget") and prop.fget else {}
+        title = params.get("label") or (prop.fget.__name__.replace("_", " ").title() if hasattr(prop, "fget") and prop.fget else "")
+        return CollapsibleGroupWidget(target_type, title=title)
+
+    def __init__(self, target_type: type, title: str = "", expanded: bool = False) -> None:
+        super().__init__()
+        self.form = PropertyForm.from_type(target_type)
+        self.expander = Expander(title=title, content_widget=self.form, expanded=expanded)
+        self.grid_layout.addWidget(self.expander, 0, 0)
+        self.form.value_changed.connect(self.value_changed.emit)
+        self.form.property_changed.connect(lambda n, v: self.value_changed.emit(self.value))
+
+    @property
+    def value(self) -> object:
+        return self.form.value
+
+    @value.setter
+    def value(self, v: object) -> None:
+        self.form.value = v
+
+
 class VisualContextPlugin(Plugin):
     label = "Visual Context (Scene Captioning)"
 
@@ -543,8 +626,8 @@ class VisualContextPlugin(Plugin):
         self._skip_similar = True
         self._similarity_threshold = 6.0
 
-        self._font_size = 26
-        self._text_color = QColor("#FFFFFF")
+        self._caption_style = CaptionStyle()
+        self._caption_style.changed.connect(self.changed.emit)
         self._bg_color = QColor(0, 0, 0, 160)
 
         self._narrate_captions = False
@@ -748,24 +831,37 @@ class VisualContextPlugin(Plugin):
         self.changed.emit()
 
     @property
-    @property_params(label="Caption Font Size", min=10, max=100)
+    @property_params(primary=True, widget=CollapsibleGroupWidget, label="Caption Style")
+    def caption_style(self) -> CaptionStyle:
+        return self._caption_style
+
+    @caption_style.setter
+    def caption_style(self, value: CaptionStyle | dict) -> None:
+        if isinstance(value, dict):
+            self._caption_style.__setstate__(value)
+        elif isinstance(value, CaptionStyle):
+            self._caption_style = value
+            self._caption_style.changed.connect(self.changed.emit)
+        self.changed.emit()
+
+    # Backward compatibility proxies
+    @property
+    @property_params(widget=None, dont_encode=True)
     def font_size(self) -> int:
-        return self._font_size
+        return self._caption_style.font_size
 
     @font_size.setter
     def font_size(self, v: int) -> None:
-        self._font_size = min(max(int(v), 10), 100)
-        self.changed.emit()
+        self._caption_style.font_size = v
 
     @property
-    @property_params(label="Caption Text Color")
+    @property_params(widget=None, dont_encode=True)
     def text_color(self) -> QColor:
-        return self._text_color
+        return self._caption_style.text_color
 
     @text_color.setter
     def text_color(self, v: QColor) -> None:
-        self._text_color = QColor(v)
-        self.changed.emit()
+        self._caption_style.text_color = v
 
     # ------------------------------------------------------------------
     # Actions
@@ -1196,7 +1292,7 @@ class VisualContextPlugin(Plugin):
 
         painter.save()
         try:
-            painter.setFont(QFont("Arial", self._font_size, QFont.Weight.Normal))
+            painter.setFont(QFont("Arial", self.font_size, QFont.Weight.Normal))
             fm = painter.fontMetrics()
 
             flags = (
@@ -1226,7 +1322,7 @@ class VisualContextPlugin(Plugin):
             ).intersected(frame_rect)
 
             painter.fillRect(background, self._bg_color)
-            painter.setPen(QPen(self._text_color))
+            painter.setPen(QPen(self.text_color))
             painter.drawText(bounding_rect, flags, text)
         finally:
             painter.restore()
