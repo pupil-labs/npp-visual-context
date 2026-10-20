@@ -37,6 +37,7 @@ import json
 import logging
 import math
 import platform
+import re
 import sys
 import tempfile
 import time
@@ -44,12 +45,22 @@ from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
+import html
 import numpy as np
 from PIL import Image
 from pupil_labs.neon_player import Plugin, ProgressUpdate, action
 from pupil_labs.neon_player.plugins.events import EventsPlugin
-from PySide6.QtCore import QObject, QRect, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen
+from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QIcon,
+    QPainter,
+    QPen,
+    QTextDocument,
+    QTextOption,
+)
 from PySide6.QtTextToSpeech import QTextToSpeech
 from PySide6.QtWidgets import (
     QComboBox,
@@ -67,7 +78,12 @@ from qt_property_widgets.utilities import (
     action_params,
     property_params,
 )
-from qt_property_widgets.widgets import Expander, PropertyForm, PropertyWidget
+from qt_property_widgets.widgets import (
+    ColorWidget,
+    Expander,
+    PropertyForm,
+    PropertyWidget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -529,6 +545,96 @@ class _Captioner:
                 logger.debug("Could not clear the MLX cache", exc_info=True)
 
 
+class CaptionColors(PersistentPropertiesMixin, QObject):
+    """Pair of text and highlight colors."""
+
+    changed = Signal()
+
+    def __init__(
+        self,
+        text_color: QColor | str = "#FFFFFF",
+        highlight_color: QColor | str = "#FFD600",
+    ) -> None:
+        super().__init__()
+        self._text_color = QColor(text_color)
+        self._highlight_color = QColor(highlight_color)
+
+    @property
+    def text_color(self) -> QColor:
+        return self._text_color
+
+    @text_color.setter
+    def text_color(self, v: QColor | str) -> None:
+        self._text_color = QColor(v)
+        self.changed.emit()
+
+    @property
+    def highlight_color(self) -> QColor:
+        return self._highlight_color
+
+    @highlight_color.setter
+    def highlight_color(self, v: QColor | str) -> None:
+        self._highlight_color = QColor(v)
+        self.changed.emit()
+
+
+class CaptionColorsWidget(PropertyWidget):
+    """Places Text Color and Highlight Color widgets side-by-side on the same row."""
+
+    value_changed = Signal(object)
+
+    @staticmethod
+    def from_property_impl(prop: property) -> "CaptionColorsWidget":
+        return CaptionColorsWidget()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._value = CaptionColors()
+
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.label_text = QLabel("Color:")
+        self.widget_text = ColorWidget()
+        self.label_hl = QLabel("Highlight:")
+        self.widget_hl = ColorWidget()
+
+        layout.addWidget(self.label_text)
+        layout.addWidget(self.widget_text)
+        layout.addSpacing(10)
+        layout.addWidget(self.label_hl)
+        layout.addWidget(self.widget_hl)
+
+        self.grid_layout.addLayout(layout, 0, 0)
+
+        self.widget_text.value_changed.connect(self._on_text_changed)
+        self.widget_hl.value_changed.connect(self._on_hl_changed)
+
+    def _on_text_changed(self, col: QColor) -> None:
+        if self._value is not None:
+            self._value.text_color = col
+            self.value_changed.emit(self._value)
+
+    def _on_hl_changed(self, col: QColor) -> None:
+        if self._value is not None:
+            self._value.highlight_color = col
+            self.value_changed.emit(self._value)
+
+    @property
+    def value(self) -> CaptionColors:
+        return self._value
+
+    @value.setter
+    def value(self, val: CaptionColors | dict) -> None:
+        if isinstance(val, dict):
+            self._value.__setstate__(val)
+        elif isinstance(val, CaptionColors):
+            self._value = val
+        self.widget_text.value = self._value.text_color
+        self.widget_hl.value = self._value.highlight_color
+
+
 class CaptionStyle(PersistentPropertiesMixin, QObject):
     """Caption appearance and style settings."""
 
@@ -537,7 +643,8 @@ class CaptionStyle(PersistentPropertiesMixin, QObject):
     def __init__(self) -> None:
         super().__init__()
         self._font_size = 26
-        self._text_color = QColor("#FFFFFF")
+        self._colors = CaptionColors()
+        self._colors.changed.connect(self.changed.emit)
 
     @property
     @property_params(label="Font Size", min=10, max=100)
@@ -551,15 +658,37 @@ class CaptionStyle(PersistentPropertiesMixin, QObject):
         self.changed.emit()
 
     @property
-    @property_params(label="Text Color")
+    @property_params(label="Colors", widget=CaptionColorsWidget)
+    def colors(self) -> CaptionColors:
+        return self._colors
+
+    @colors.setter
+    def colors(self, v: CaptionColors | dict) -> None:
+        if isinstance(v, dict):
+            self._colors.__setstate__(v)
+        elif isinstance(v, CaptionColors):
+            self._colors = v
+            self._colors.changed.connect(self.changed.emit)
+        self.changed.emit()
+
+    # Backward compatibility proxies
+    @property
+    @property_params(widget=None, dont_encode=True)
     def text_color(self) -> QColor:
-        """Caption Text Color"""
-        return self._text_color
+        return self._colors.text_color
 
     @text_color.setter
-    def text_color(self, v: QColor) -> None:
-        self._text_color = QColor(v)
-        self.changed.emit()
+    def text_color(self, v: QColor | str) -> None:
+        self._colors.text_color = v
+
+    @property
+    @property_params(widget=None, dont_encode=True)
+    def highlight_color(self) -> QColor:
+        return self._colors.highlight_color
+
+    @highlight_color.setter
+    def highlight_color(self, v: QColor | str) -> None:
+        self._colors.highlight_color = v
 
 
 class CollapsibleGroupWidget(PropertyWidget):
@@ -862,6 +991,34 @@ class VisualContextPlugin(Plugin):
     @text_color.setter
     def text_color(self, v: QColor) -> None:
         self._caption_style.text_color = v
+
+    @property
+    @property_params(widget=None, dont_encode=True)
+    def highlight_color(self) -> QColor:
+        return self._caption_style.highlight_color
+
+    @highlight_color.setter
+    def highlight_color(self, v: QColor) -> None:
+        self._caption_style.highlight_color = v
+
+    def _get_saw_keywords(self) -> set[str]:
+        """Collect all keywords associated with 'Saw: <keyword>' events."""
+        keywords: set[str] = set()
+        events_plugin = EventsPlugin.instance()
+        if events_plugin is not None:
+            if hasattr(events_plugin, "event_types"):
+                for et in events_plugin.event_types:
+                    if hasattr(et, "name") and et.name.startswith("Saw: "):
+                        kw = et.name[5:].strip()
+                        if kw:
+                            keywords.add(kw)
+            if hasattr(events_plugin, "_events"):
+                for name in events_plugin._events:
+                    if name.startswith("Saw: "):
+                        kw = name[5:].strip()
+                        if kw:
+                            keywords.add(kw)
+        return keywords
 
     # ------------------------------------------------------------------
     # Actions
@@ -1322,7 +1479,44 @@ class VisualContextPlugin(Plugin):
             ).intersected(frame_rect)
 
             painter.fillRect(background, self._bg_color)
-            painter.setPen(QPen(self.text_color))
-            painter.drawText(bounding_rect, flags, text)
+
+            # Highlight keywords from any "Saw: <keyword>" events
+            matching_keywords = [
+                kw
+                for kw in self._get_saw_keywords()
+                if re.search(rf"\b{re.escape(kw)}\b", text, re.IGNORECASE)
+            ]
+
+            if matching_keywords:
+                doc = QTextDocument()
+                doc.setDefaultFont(painter.font())
+                doc.setDocumentMargin(0)
+                opt = QTextOption()
+                opt.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+                opt.setWrapMode(QTextOption.WrapMode.WordWrap)
+                doc.setDefaultTextOption(opt)
+                doc.setTextWidth(bounding_rect.width())
+
+                hl_hex = self.highlight_color.name()
+                text_hex = self.text_color.name()
+                escaped = html.escape(text)
+                for kw in matching_keywords:
+                    escaped = re.sub(
+                        rf"\b({re.escape(html.escape(kw))})\b",
+                        rf'<span style="color: {hl_hex}; font-weight: bold;">\1</span>',
+                        escaped,
+                        flags=re.IGNORECASE,
+                    )
+                doc.setHtml(
+                    f'<div style="text-align: center; color: {text_hex};">{escaped}</div>'
+                )
+
+                painter.save()
+                painter.translate(QPointF(bounding_rect.topLeft()))
+                doc.drawContents(painter)
+                painter.restore()
+            else:
+                painter.setPen(QPen(self.text_color))
+                painter.drawText(bounding_rect, flags, text)
         finally:
             painter.restore()
