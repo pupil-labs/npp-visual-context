@@ -7,6 +7,7 @@
 #     "accelerate; sys_platform != 'darwin' or platform_machine != 'arm64'",
 #     "numpy",
 #     "pillow",
+#     "mcp",
 # ]
 # ///
 
@@ -42,8 +43,10 @@ import platform
 import re
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Generator
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
@@ -51,11 +54,12 @@ import numpy as np
 from PIL import Image
 from pupil_labs.neon_player import Plugin, ProgressUpdate, action
 from pupil_labs.neon_player.plugins.events import EventsPlugin
-from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetrics,
+    QGuiApplication,
     QIcon,
     QPainter,
     QPen,
@@ -1428,8 +1432,108 @@ class CaptioningSettings(PersistentPropertiesMixin, QObject):
                 self.prompt = text
 
 
+class MCPInfoWidget(PropertyWidget):
+    """Displays MCP endpoint URL and a button to copy configuration."""
+
+    value_changed = Signal(object)
+
+    @staticmethod
+    def from_property_impl(prop: property) -> MCPInfoWidget:
+        return MCPInfoWidget()
+
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(6)
+
+        self.endpoint_label = QLabel("http://127.0.0.1:8765/mcp")
+        self.endpoint_label.setStyleSheet(
+            "font-family: monospace; font-size: 11px;"
+        )
+        layout.addWidget(self.endpoint_label)
+
+        self.btn_copy = QPushButton("Copy Config")
+        self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy.clicked.connect(self._copy_config)
+        layout.addWidget(self.btn_copy)
+
+        self.grid_layout.addLayout(layout, 0, 0)
+        self._target_instance: Any = None
+
+    def on_bind(self, instance: Any) -> None:
+        super().on_bind(instance)
+        self._target_instance = instance
+        self._update_url()
+        if hasattr(instance, "changed") and hasattr(instance.changed, "connect"):
+            instance.changed.connect(self._update_url)
+
+    def _get_port(self) -> int:
+        if self._target_instance and hasattr(self._target_instance, "port"):
+            return getattr(self._target_instance, "port", 8765)
+        return 8765
+
+    def _update_url(self) -> None:
+        port = self._get_port()
+        self.endpoint_label.setText(f"http://127.0.0.1:{port}/mcp")
+
+    def _copy_config(self) -> None:
+        port = self._get_port()
+        config_text = json.dumps(
+            {
+                "mcpServers": {
+                    "neon-visual-context": {
+                        "url": f"http://127.0.0.1:{port}/mcp"
+                    }
+                }
+            },
+            indent=2,
+        )
+        QGuiApplication.clipboard().setText(config_text)
+        self.btn_copy.setText("Copied!")
+        QTimer.singleShot(1500, lambda: self.btn_copy.setText("Copy Config"))
+
+    @property
+    def value(self) -> Any:
+        return None
+
+    @value.setter
+    def value(self, v: Any) -> None:
+        pass
+
+
+class MCPSettings(PersistentPropertiesMixin, QObject):
+    """MCP server configuration and endpoint."""
+
+    changed = Signal()
+
+    def __init__(self, port: int = 8765) -> None:
+        super().__init__()
+        self._port = port
+
+    @property
+    @property_params(label="Server Port", min=1024, max=65535)
+    def port(self) -> int:
+        return self._port
+
+    @port.setter
+    def port(self, v: int) -> None:
+        self._port = int(v)
+        self.changed.emit()
+
+    @property
+    @property_params(label="Endpoint", widget=MCPInfoWidget, dont_encode=True)
+    def endpoint(self) -> None:
+        return None
+
+    @endpoint.setter
+    def endpoint(self, v: Any) -> None:
+        pass
+
+
 class VisualContextPlugin(Plugin):
     label = "Visual Context (Scene Captioning)"
+    _mcp_dispatch = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1447,6 +1551,13 @@ class VisualContextPlugin(Plugin):
         self._caption_style = CaptionStyle()
         self._caption_style.changed.connect(self.changed.emit)
         self._bg_color = QColor(0, 0, 0, 160)
+
+        self._mcp_settings = MCPSettings()
+        self._mcp_settings.changed.connect(self.changed.emit)
+        self._mcp_enabled = False
+        self._mcp_uvicorn: Any = None
+        self._mcp_server_thread: threading.Thread | None = None
+        self._mcp_dispatch.connect(lambda fn: fn())
 
         self._narrate_captions = False
         self._last_narrated_ns = -1
@@ -1716,6 +1827,56 @@ class VisualContextPlugin(Plugin):
                             keywords.add(kw)
         return keywords
 
+    @property
+    @property_params(
+        primary=True,
+        widget=CollapsibleGroupWidget,
+        label="Model Context Protocol (MCP)",
+        enable_prop="mcp_enabled",
+    )
+    def mcp_settings(self) -> MCPSettings:
+        return self._mcp_settings
+
+    @mcp_settings.setter
+    def mcp_settings(self, value: MCPSettings | dict) -> None:
+        if isinstance(value, dict):
+            self._mcp_settings.__setstate__(value)
+        elif isinstance(value, MCPSettings):
+            self._mcp_settings = value
+            self._mcp_settings.changed.connect(self.changed.emit)
+        self.changed.emit()
+
+    @property
+    @property_params(widget=None)
+    def mcp_enabled(self) -> bool:
+        return self._mcp_enabled
+
+    @mcp_enabled.setter
+    def mcp_enabled(self, v: bool) -> None:
+        enabled = bool(v)
+        if self._mcp_enabled == enabled:
+            return
+        self._mcp_enabled = enabled
+        if self._mcp_enabled:
+            self._start_mcp_server()
+        else:
+            self._stop_mcp_server()
+        self.changed.emit()
+
+    @property
+    @property_params(widget=None, dont_encode=True)
+    def mcp_port(self) -> int:
+        return self._mcp_settings.port
+
+    @mcp_port.setter
+    def mcp_port(self, v: int) -> None:
+        self._mcp_settings.port = v
+
+    def on_disabled(self) -> None:
+        self._stop_mcp_server()
+        if getattr(self, "_tts", None):
+            self._tts.stop()
+
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
@@ -1869,6 +2030,54 @@ class VisualContextPlugin(Plugin):
         self.app.show_notification(
             "Export Complete", f"Wrote {len(self._captions)} captions."
         )
+
+    def _run_on_main(self, fn: Any, timeout: float = 15.0) -> Any:
+        if QThread.currentThread() == self.thread():
+            return fn()
+        fut: Future[Any] = Future()
+
+        def _work() -> None:
+            try:
+                fut.set_result(fn())
+            except Exception as exc:  # ruff: ignore[blind-except]
+                fut.set_exception(exc)
+
+        self._mcp_dispatch.emit(_work)
+        return fut.result(timeout=timeout)
+
+    def _start_mcp_server(self) -> None:
+        if self._mcp_server_thread is not None and self._mcp_server_thread.is_alive():
+            return
+
+        server = _create_mcp_server(self)
+        if server is None:
+            return
+
+        port = self._mcp_settings.port
+        host = "127.0.0.1"
+        self._mcp_uvicorn = _build_uvicorn_server(server, host, port)
+
+        def _serve() -> None:
+            try:
+                self._mcp_uvicorn.run()
+            except Exception:
+                logger.exception("MCP server stopped with error")
+
+        self._mcp_server_thread = threading.Thread(
+            target=_serve, daemon=True, name="VisualContextMCP"
+        )
+        self._mcp_server_thread.start()
+        logger.info(
+            "VisualContextPlugin MCP server started at http://%s:%s/mcp", host, port
+        )
+
+    def _stop_mcp_server(self) -> None:
+        if self._mcp_uvicorn is not None:
+            self._mcp_uvicorn.should_exit = True
+            self._mcp_uvicorn = None
+        if self._mcp_server_thread is not None:
+            self._mcp_server_thread = None
+        logger.info("VisualContextPlugin MCP server stopped")
 
     # ------------------------------------------------------------------
     # Background work
@@ -2221,3 +2430,186 @@ class VisualContextPlugin(Plugin):
             )
         finally:
             painter.restore()
+
+
+# ----------------------------------------------------------------------
+# MCP Server Implementation & Tool Registration
+# ----------------------------------------------------------------------
+
+
+def _create_mcp_server(plugin: VisualContextPlugin) -> Any:
+    try:
+        try:
+            from mcp.server.mcpserver import MCPServer
+        except ImportError:
+            from mcp.server.fastmcp import FastMCP as MCPServer
+    except ImportError as exc:
+        logger.warning("MCP server dependencies not available: %s", exc)
+        if plugin.app:
+            plugin.app.show_notification(
+                "MCP Server",
+                "Dependencies not installed. Launch Neon Player to install them.",
+            )
+        return None
+
+    server = MCPServer("neon-visual-context")
+    _register_mcp_tools(server, plugin)
+    return server
+
+
+def _build_uvicorn_server(server: Any, host: str, port: int) -> Any:
+    import uvicorn
+
+    if hasattr(server, "streamable_http_app"):
+        app = server.streamable_http_app(streamable_http_path="/mcp")
+    elif hasattr(server, "sse_app"):
+        app = server.sse_app()
+    else:
+        raise RuntimeError("Unsupported MCP server implementation")
+
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    return uvicorn.Server(config)
+
+
+def _reg_captions(server: Any, plugin: VisualContextPlugin) -> None:
+    @server.tool()
+    def get_captions(
+        start_s: float | None = None,
+        end_s: float | None = None,
+        search: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get scene captions with timestamps and gaze info."""
+        results = []
+        for c in plugin._captions:
+            if start_s is not None and c["start_s"] < start_s:
+                continue
+            if end_s is not None and c["end_s"] > end_s:
+                continue
+            if search is not None and search.lower() not in c["text"].lower():
+                continue
+            results.append({
+                "start_ns": c["start_ns"],
+                "end_ns": c["end_ns"],
+                "start_s": round(float(c["start_s"]), 3),
+                "end_s": round(float(c["end_s"]), 3),
+                "text": c["text"],
+                "frame_index": c.get("frame_index"),
+                "event_data": c.get("event_data", {}),
+            })
+        return results
+
+    @server.tool()
+    def export_captions_csv(path: str) -> str:
+        """Export all loaded captions to a CSV file at the specified path."""
+        def _action() -> str:
+            if not plugin._captions:
+                return "No captions to export."
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "start timestamp [ns]",
+                    "end timestamp [ns]",
+                    "start time [s]",
+                    "end time [s]",
+                    "frame index",
+                    "caption",
+                ])
+                for c in plugin._captions:
+                    writer.writerow([
+                        c["start_ns"],
+                        c["end_ns"],
+                        f"{c['start_s']:.3f}",
+                        f"{c['end_s']:.3f}",
+                        c.get("frame_index", ""),
+                        _csv_safe(c["text"]),
+                    ])
+            return f"Exported {len(plugin._captions)} captions to {path}"
+
+        return plugin._run_on_main(_action)
+
+
+def _reg_events(server: Any, plugin: VisualContextPlugin) -> None:
+    @server.tool()
+    def add_events(events: dict[str, list[int]]) -> str:
+        """Add custom timeline events {event_name: [timestamp_ns, ...]}."""
+        def _action() -> str:
+            events_plugin = EventsPlugin.instance()
+            if events_plugin is None:
+                raise RuntimeError("EventsPlugin is not loaded in Neon Player.")
+            cleaned = {
+                str(name): [int(ts) for ts in timestamps]
+                for name, timestamps in events.items()
+            }
+            events_plugin.add_events(cleaned)
+            summary = {k: len(v) for k, v in cleaned.items()}
+            return f"Successfully added events: {summary}"
+
+        return plugin._run_on_main(_action)
+
+    @server.tool()
+    def create_events_from_keyword(keyword: str) -> str:
+        """Search captions for keyword and add 'Saw: <keyword>' events."""
+        def _action() -> str:
+            events_plugin = EventsPlugin.instance()
+            if events_plugin is None:
+                raise RuntimeError("EventsPlugin is not loaded in Neon Player.")
+            timestamps = _keyword_event_timestamps(plugin._captions, keyword.strip())
+            if not timestamps:
+                return f"No captions contain '{keyword}'."
+            events_plugin.add_events({f"Saw: {keyword.strip()}": timestamps})
+            return f"Added {len(timestamps)} events for '{keyword}'."
+
+        return plugin._run_on_main(_action)
+
+
+def _reg_lifecycle(server: Any, plugin: VisualContextPlugin) -> None:
+    @server.tool()
+    def generate_captions(
+        prompt: str | None = None, interval_s: float | None = None
+    ) -> str:
+        """Trigger caption generation in Neon Player for the current recording."""
+        def _action() -> str:
+            if prompt is not None:
+                plugin.prompt = prompt
+            if interval_s is not None:
+                plugin.interval_s = interval_s
+            plugin.generate_captions()
+            return "Started caption generation background job."
+
+        return plugin._run_on_main(_action)
+
+    @server.tool()
+    def get_plugin_status() -> dict[str, Any]:
+        """Get current status of VisualContextPlugin, loaded recording, and settings."""
+        rec = plugin.recording
+        rec_name = (
+            getattr(rec, "name", None)
+            or (rec._rec_dir.name if rec and hasattr(rec, "_rec_dir") else None)
+        )
+        is_running = (
+            plugin.job is not None
+            and getattr(plugin.job, "is_running", lambda: False)()
+        )
+        port = plugin._mcp_settings.port
+        return {
+            "recording_loaded": rec is not None,
+            "recording_name": rec_name,
+            "caption_count": len(plugin._captions),
+            "is_captioning_running": is_running,
+            "model": (
+                plugin.model.value
+                if hasattr(plugin.model, "value")
+                else str(plugin.model)
+            ),
+            "prompt": plugin.prompt,
+            "interval_s": plugin.interval_s,
+            "mcp_url": f"http://127.0.0.1:{port}/mcp",
+        }
+
+
+def _register_mcp_tools(server: Any, plugin: VisualContextPlugin) -> None:
+    _reg_captions(server, plugin)
+    _reg_events(server, plugin)
+    _reg_lifecycle(server, plugin)
