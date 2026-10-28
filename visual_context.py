@@ -34,6 +34,7 @@ import bisect
 import csv
 import enum
 import gc
+import hashlib
 import html
 import json
 import logging
@@ -213,6 +214,36 @@ class CaptionModel(enum.Enum):
             CaptionModel.Balanced_4B: "Qwen/Qwen3-VL-4B-Instruct",
             CaptionModel.Quality_8B: "Qwen/Qwen3-VL-8B-Instruct",
         }[self]
+
+
+def _settings_cache_key(
+    model: str,
+    prompt: str,
+    interval_s: float,
+    skip_similar: bool,
+    similarity_threshold: float,
+) -> str:
+    """Return a deterministic short SHA-256 hash for a captioning configuration."""
+    raw = (
+        f"{model}|{prompt.strip()}|{interval_s:.3f}|"
+        f"{bool(skip_similar)}|{similarity_threshold:.2f}"
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+
+
+def _cache_filename_for(
+    model: str,
+    prompt: str,
+    interval_s: float,
+    skip_similar: bool,
+    similarity_threshold: float,
+) -> str:
+    """Build the settings-specific cache filename for a model and settings."""
+    key = _settings_cache_key(
+        model, prompt, interval_s, skip_similar, similarity_threshold
+    )
+    model_tag = re.sub(r"[^a-zA-Z0-9_.-]", "_", model.split("/")[-1])
+    return f"visual_context_{model_tag}_{key}.json"
 
 
 def _format_time(seconds: float) -> str:
@@ -1565,7 +1596,7 @@ class VisualContextPlugin(Plugin):
         self._show_captions = True
         self._model = CaptionModel.Balanced_4B
         self._settings = CaptioningSettings()
-        self._settings.changed.connect(self.changed.emit)
+        self._settings.changed.connect(self._on_settings_or_model_changed)
 
         self._caption_style = CaptionStyle()
         self._caption_style.changed.connect(self.changed.emit)
@@ -1590,13 +1621,73 @@ class VisualContextPlugin(Plugin):
     # Cache handling
     # ------------------------------------------------------------------
 
+    def _active_model_repo(self) -> str:
+        """Return the repository ID for the currently selected model preset."""
+        if isinstance(self._model, CaptionModel):
+            return (
+                self._model.mlx_repo
+                if _is_apple_silicon()
+                else self._model.hf_repo
+            )
+        return str(self._model)
+
+    def _current_cache_filename(self) -> str:
+        """Return the settings-hashed cache filename for the active configuration."""
+        return _cache_filename_for(
+            self._active_model_repo(),
+            self.prompt,
+            self.interval_s,
+            self.skip_similar,
+            self.similarity_threshold,
+        )
+
     def _read_cache(self, recording: Any = None) -> dict[str, Any] | None:
+        target_filename = self._current_cache_filename()
         try:
-            data = self.load_cached_json(CACHE_FILENAME, recording=recording)
+            data = self.load_cached_json(target_filename, recording=recording)
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, OSError):
+            logger.exception("Failed to read visual context cache %s", target_filename)
+
+        try:
+            legacy = self.load_cached_json(CACHE_FILENAME, recording=recording)
         except (json.JSONDecodeError, OSError):
             logger.exception("Failed to read visual context cache")
             return None
-        return data if isinstance(data, dict) else None
+
+        if not isinstance(legacy, dict):
+            return None
+
+        if (
+            legacy.get("model") == self._active_model_repo()
+            and str(legacy.get("prompt", "")).strip() == self.prompt.strip()
+            and abs(float(legacy.get("interval_s", -1.0)) - float(self.interval_s))
+            < 1e-3
+        ):
+            if "skip_similar" in legacy and bool(legacy["skip_similar"]) != bool(
+                self.skip_similar
+            ):
+                return None
+            if (
+                self.skip_similar
+                and "similarity_threshold" in legacy
+                and abs(
+                    float(legacy["similarity_threshold"])
+                    - float(self.similarity_threshold)
+                )
+                >= 1e-2
+            ):
+                return None
+            return legacy
+
+        return None
+
+    def _on_settings_or_model_changed(self) -> None:
+        rec = getattr(self, "recording", None)
+        if rec is not None:
+            self.on_recording_loaded(rec)
+        self.changed.emit()
 
     @staticmethod
     def _valid_captions(data: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -1723,8 +1814,15 @@ class VisualContextPlugin(Plugin):
 
     @model.setter
     def model(self, v: CaptionModel) -> None:
+        if isinstance(v, str):
+            try:
+                v = CaptionModel(v)
+            except ValueError:
+                v = CaptionModel[v]
+        if self._model == v:
+            return
         self._model = v
-        self.changed.emit()
+        self._on_settings_or_model_changed()
 
     @property
     @property_params(
@@ -1741,8 +1839,8 @@ class VisualContextPlugin(Plugin):
             self._settings.__setstate__(value)
         elif isinstance(value, CaptioningSettings):
             self._settings = value
-            self._settings.changed.connect(self.changed.emit)
-        self.changed.emit()
+            self._settings.changed.connect(self._on_settings_or_model_changed)
+        self._on_settings_or_model_changed()
 
     # Backward compatibility proxies
     @property
@@ -2157,15 +2255,22 @@ class VisualContextPlugin(Plugin):
         A background job that raises is reported to the UI as a successful
         completion, so without this the user is told a failed run worked.
         """
+        payload = {
+            "version": CACHE_VERSION,
+            "recording_start_time": self.recording.start_time,
+            "model": self._active_model_repo(),
+            "prompt": self.prompt,
+            "interval_s": self.interval_s,
+            "skip_similar": self.skip_similar,
+            "similarity_threshold": self.similarity_threshold,
+            "error": message,
+        }
         try:
-            self.save_cached_json(
-                CACHE_FILENAME,
-                {
-                    "version": CACHE_VERSION,
-                    "recording_start_time": self.recording.start_time,
-                    "error": message,
-                },
-            )
+            target_filename = self._current_cache_filename()
+            existing = self.load_cached_json(target_filename)
+            if not (isinstance(existing, dict) and existing.get("captions")):
+                self.save_cached_json(target_filename, payload)
+            self.save_cached_json(CACHE_FILENAME, payload)
         except OSError:
             logger.exception("Could not record the captioning failure")
 
@@ -2188,23 +2293,32 @@ class VisualContextPlugin(Plugin):
             raise RuntimeError(message)
 
         _assign_end_times(captions, times_ns, self.recording.start_time)
-        self.save_cached_json(
-            CACHE_FILENAME,
-            {
-                "version": CACHE_VERSION,
-                "recording_start_time": self.recording.start_time,
-                "model": captioner.repo,
-                "backend": captioner.backend,
-                "prompt": self.prompt,
-                "interval_s": self.interval_s,
-                "captions": captions,
-                "total_time_s": time.time() - t_start,
-            },
+        payload = {
+            "version": CACHE_VERSION,
+            "recording_start_time": self.recording.start_time,
+            "model": captioner.repo,
+            "backend": captioner.backend,
+            "prompt": self.prompt,
+            "interval_s": self.interval_s,
+            "skip_similar": self.skip_similar,
+            "similarity_threshold": self.similarity_threshold,
+            "captions": captions,
+            "total_time_s": time.time() - t_start,
+        }
+        cache_filename = _cache_filename_for(
+            captioner.repo,
+            self.prompt,
+            self.interval_s,
+            self.skip_similar,
+            self.similarity_threshold,
         )
+        self.save_cached_json(cache_filename, payload)
+        self.save_cached_json(CACHE_FILENAME, payload)
         logger.info(
-            "Captioned %d scene frames (%d reused from near-identical frames)",
+            "Captioned %d scene frames (%d reused from near-identical frames) -> %s",
             len(captions),
             reused,
+            cache_filename,
         )
 
     def bg_generate_captions(self) -> Generator[ProgressUpdate, None, None]:

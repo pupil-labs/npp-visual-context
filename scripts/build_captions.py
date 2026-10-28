@@ -158,7 +158,9 @@ def main() -> None:
     # 5. Report results
     cache_path = plugin.get_cache_path(recording=recording)
     if cache_path:
-        cache_file = cache_path / "visual_context.json"
+        cache_file = cache_path / plugin._current_cache_filename()
+        if not cache_file.exists():
+            cache_file = cache_path / "visual_context.json"
         if cache_file.exists():
             with cache_file.open("r") as f:
                 data = json.load(f)
