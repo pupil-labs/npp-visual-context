@@ -116,103 +116,25 @@ CAPTION_BAND_HEIGHT = 0.28
 CAPTION_BAND_WIDTH = 0.85
 
 DEFAULT_PROMPT = (
-    "Describe what is visible in this first-person scene camera image in one "
-    "short sentence. Name the main objects, people and activity. Do not "
-    "speculate about anything you cannot see."
+    "In a telegraphic, action-first phrase (under 15 words), describe what is visible and being done in this first-person scene. "
+    "Start directly with an active verb or main objects (e.g. 'Pushing bicycle past brick stairs', 'Sitting at desk typing'). "
+    "Do not use filler phrases or third-person perspective words like 'A person' or 'The image shows'."
 )
 
 EVENT_GAZE_SYSTEM_PROMPT = """\
-You are a visual scene understanding system analyzing sequential frames
-recorded by the scene camera of a Pupil Labs Neon eye tracker.
-The camera is worn by a person. Each frame represents the wearer's visual environment.
-The wearer's gaze position is provided as image coordinates.
-Your task is to produce detailed, factual, temporally consistent descriptions of
-the visible scene that can be used to reconstruct activities, object interactions,
-and events over time.
+You are an event-oriented, gaze-aware visual scene understanding system analyzing sequential frames from a scene camera worn by a person.
+The wearer's gaze position is provided as pixel coordinates (x, y).
 
-1. Scene understanding
-Identify all visually distinguishable objects, people, surfaces, text, and
-relevant environmental elements.
-When an object first appears, describe it in sufficient detail to distinguish it
-from other objects, including:
-- Object category and recognizable identity
-- Color, shape, size, and distinctive visual features
-- Position relative to other objects
-- Relevant spatial relationships
-- Visible state, such as open, closed, occupied, empty, held, or moving
-Describe the environment and its spatial arrangement when first observed.
-Only describe what is supported by visual evidence. Do not invent hidden objects,
-intentions, identities, or actions.
+Your task is to produce a concise, telegraphic factual update of what is happening right now in the scene.
 
-2. Temporal consistency and memory
-You will receive the previous scene state and recent observations.
-Treat each frame as part of a continuous sequence rather than an independent image.
-- Describe new objects when they first become visible.
-- Do not repeat descriptions of objects already identified unless their state,
-  position, or relationship changes meaningfully.
-- Maintain consistent object identities across frames whenever possible.
-- Track objects that disappear and reappear.
-- Distinguish actual object movement from changes caused by head or camera motion.
-- Do not interpret an object leaving the camera's field of view as the object
-  physically leaving the environment.
-- Report meaningful changes even when no new objects appear.
-If the scene remains unchanged, return NO_CHANGE rather than paraphrasing
-the previous description.
-
-3. Gaze awareness
-The gaze coordinates (x, y) indicate where the wearer is looking within the
-image of width W and height H.
-Use gaze to determine which visible object or region is being visually attended to.
-- Identify the object containing the gaze point when possible.
-- If the gaze point falls near multiple objects, express uncertainty.
-- Give additional descriptive priority to newly observed objects near gaze.
-- Track changes in the attended object across frames.
-- Distinguish looking at an object from physically interacting with it.
-- Never assume that gaze alone proves attention, intention, recognition,
-  or understanding.
-- Do not invent an object at the gaze location.
-Gaze is an additional signal for scene understanding, not proof of an action.
-
-4. Event extraction
-Identify meaningful observable events, including:
-- An object entering or leaving the visible scene
-- A person entering or leaving the visible scene
-- An object being picked up, placed, opened, closed, moved, or manipulated
-- A person approaching, moving away, or interacting with an object
-- A change in the state of a visible object
-- A change in the object being looked at
-- A meaningful transition between activities or environments
-Describe events using observable subjects, actions, objects, and resulting states.
-Distinguish between:
-- Directly observed events
-- Events suggested by incomplete visual evidence
-- Uncertain interpretations
-Do not infer an event solely from the presence of an object.
-
-5. Description rules
-- Use precise, natural, factual language.
-- Prioritize observable actions, objects, and spatial relationships.
-- Describe objects in detail on first appearance, then reference them concisely.
-- Avoid redundant statements and repeated background descriptions.
-- Do not describe camera perspective, camera angle, lens properties, field of view,
-  sharpness, blur, exposure, resolution, lighting quality, or recording artifacts.
-- Do not use phrases like "the image shows", "in this frame", or "we can see".
-- Do not describe the wearer unless a body part or an action is visibly observable.
-- Avoid speculation about thoughts, intentions, or motivations.
-- Use consistent object names across the sequence.
-- Prefer specific verbs over vague descriptions.
-- Do not invent changes when the scene is stable.
-
-6. Output
-Generate a concise scene update that contains only new information, meaningful
-changes, and observed events.
-When a new scene appears, provide a detailed initial description.
-When a previously described scene remains stable, output NO_CHANGE.
-When an event occurs, describe the event with subject, action, object, and result.
-Include the gaze target when it can be visually identified.
-Do not repeat the entire scene description on every frame.
-You can output valid JSON (e.g. {"scene_update": "...", "events": [...]})
-or clear factual prose."""
+Rules:
+1. Focus strictly on observable actions, visible objects, and what the wearer is looking at or interacting with.
+2. Limit the scene update to 1 short, telegraphic action-first phrase (under 15 words, e.g. "Holding phone with map next to parked bicycle", "Reaching for door handle to outdoor stairs").
+3. NEVER use filler phrases (do NOT say "The wearer is", "The camera wearer", "A person is", "The environment is", "In this image", "The camera shows", "The person's gaze is on"). Start directly with the action or objects.
+4. Only describe objects that are currently visible. When the scene or environment changes, describe the new scene and do not repeat previous objects.
+5. If the scene, objects, and wearer action are unchanged, return NO_CHANGE.
+6. Output valid JSON in the format:
+{"scene_update": "<telegraphic action phrase>", "gaze_target": "<object or surface at gaze point>", "events": ["<notable action if any>"]}"""
 
 EVENT_GAZE_PROMPT_TEMPLATE = (
     "Event-oriented, gaze-aware scene understanding with temporal memory. "
@@ -223,6 +145,12 @@ EVENT_GAZE_PROMPT_TEMPLATE = (
 
 PROMPT_TEMPLATES = {
     "Default": DEFAULT_PROMPT,
+    "Gaze & Action": (
+        "In a telegraphic, action-first phrase (under 15 words), describe what is being done or looked at in this first-person scene. "
+        "The gaze point is at ({gaze_x}, {gaze_y}) in this {width}x{height} image. "
+        "Start directly with an active verb or object (e.g. 'Holding phone with map', 'Pushing bicycle up stairs', 'Reaching for door handle'). "
+        "NEVER use filler phrases like 'The wearer', 'The camera wearer', 'A person', 'A first-person view', 'This image shows', or 'The environment is'."
+    ),
     "Event & Gaze Aware (Temporal)": EVENT_GAZE_PROMPT_TEMPLATE,
     "Gazed Object (One Word)": (
         "The user's gaze is at pixel coordinates ({gaze_x}, {gaze_y}) in this "
@@ -245,6 +173,7 @@ PROMPT_TEMPLATES = {
 
 class PromptTemplate(enum.Enum):
     Default = "Default"
+    Gaze_Action = "Gaze & Action"
     Event_Gaze_Aware = "Event & Gaze Aware (Temporal)"
     Gazed_Object = "Gazed Object (One Word)"
     Detailed_Scene = "Detailed Scene"
@@ -413,11 +342,32 @@ _BOILERPLATE_LEADS = (
     "this image depicts",
     "the photo shows",
     "this photo shows",
+    "the environment is",
+    "this environment is",
+    "the scene depicts",
+    "the camera is focused on",
+    "the camera shows",
+    "the view shows",
+    "a view of",
 )
 _ARTICLES = ("a ", "an ", "the ")
 
 #: Openers stripped outright, article and all.
-_BOILERPLATE_CLAUSES = ("in this image, ", "in the image, ", "in this photo, ")
+_BOILERPLATE_CLAUSES = (
+    "in this image, ",
+    "in the image, ",
+    "in this photo, ",
+    "in this frame, ",
+    "in this scene, ",
+)
+
+_FILLER_REGEX = re.compile(
+    r"^(in |from )?a first-person (view|perspective)( shows| of| from|,)?\s*"
+    r"|^(the )?(camera )?wearer('s| is| looks| holds| stands| sees)?( now)?( seen| looking at| holding)?\s*"
+    r"|^a person('s| is| holds| stands)?( seen)?( looking at| holding)?\s*"
+    r"|^(this |the )?(image|photo|scene|environment)( shows| depicts| is)?( a| an)?\s*",
+    re.IGNORECASE,
+)
 
 
 def _capitalize(text: str) -> str:
@@ -432,6 +382,8 @@ def _clean_caption(text: Any) -> str:
         return ""
 
     cleaned = " ".join(text.split())
+    # Strip leading subject/perspective filler (e.g. "The camera wearer is looking at...")
+    cleaned = _FILLER_REGEX.sub("", cleaned).strip()
     lowered = cleaned.lower()
 
     for clause in _BOILERPLATE_CLAUSES:
@@ -447,7 +399,16 @@ def _clean_caption(text: Any) -> str:
         if remainder.lower().startswith(_ARTICLES):
             return _capitalize(remainder)
 
-    return cleaned
+    return _capitalize(cleaned)
+
+
+def _clean_event_str(text: Any) -> str:
+    """Strip template placeholders (<...>) and clean VLM boilerplate."""
+    if not isinstance(text, str):
+        return ""
+    # Strip literal prompt placeholders like <object being looked at>
+    stripped = re.sub(r"<[^>]+>", "", text)
+    return _clean_caption(stripped)
 
 
 def _fit_text(
@@ -578,10 +539,11 @@ def _parse_json_event_payload(
         text = previous_state or "No change."
         is_no_change = True
     elif scene_update:
-        text = str(scene_update).strip()
+        text = _clean_event_str(str(scene_update))
         is_no_change = False
     else:
-        text = str(parsed.get("description", raw_text)).strip()
+        desc = parsed.get("description", raw_text)
+        text = _clean_event_str(str(desc))
         is_no_change = False
 
     new_events: list[str] = []
@@ -591,22 +553,38 @@ def _parse_json_event_payload(
             if isinstance(ev, dict):
                 d = ev.get("description") or ev.get("type") or str(ev)
                 if d:
-                    new_events.append(str(d).strip())
+                    cleaned_ev = _clean_event_str(str(d))
+                    if cleaned_ev:
+                        new_events.append(cleaned_ev)
             elif isinstance(ev, str) and ev.strip():
-                new_events.append(ev.strip())
+                cleaned_ev = _clean_event_str(ev)
+                if cleaned_ev:
+                    new_events.append(cleaned_ev)
 
     return text, is_no_change, parsed, new_events
 
 
 def _regex_extract_update(text: str) -> str | None:
-    """Fallback regex to extract scene update from truncated JSON."""
-    match = re.search(r'"scene_update"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)', text)
+    """Fallback regex to extract scene update from truncated or partial JSON."""
+    match = re.search(r'"scene_update"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', text)
+    if not match:
+        match = re.search(r'"description"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', text)
+    if not match:
+        match = re.search(r'"scene_update"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)', text)
     if not match:
         match = re.search(r'"description"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)', text)
     if match:
         extracted = match.group(1).replace(r'\"', '"').replace(r"\n", " ").strip()
-        if extracted:
-            return extracted
+        # If output was cut off mid-sentence, trim to last complete sentence
+        if extracted and not extracted.endswith((".", "!", "?")):
+            last_period = max(
+                extracted.rfind("."), extracted.rfind("!"), extracted.rfind("?")
+            )
+            if last_period > 10:
+                extracted = extracted[: last_period + 1].strip()
+        cleaned = _clean_event_str(extracted)
+        if cleaned:
+            return cleaned
     return None
 
 
@@ -622,6 +600,10 @@ def _parse_temporal_response(
         or clean_upper.rstrip(".").endswith("NO_CHANGE")
         or clean_upper.startswith("NO_CHANGE")
     ):
+        return previous_scene_state or "No change.", True, None, []
+
+    # Discard prompt echoes
+    if "frame_index" in clean_resp and "image_width" in clean_resp:
         return previous_scene_state or "No change.", True, None, []
 
     json_str = _extract_json_block(clean_resp)
@@ -648,7 +630,8 @@ def _parse_temporal_response(
     if clean_resp.startswith("{"):
         return previous_scene_state or "No change.", True, None, []
 
-    return clean_resp, False, None, [clean_resp]
+    cleaned = _clean_event_str(clean_resp)
+    return cleaned, False, None, [cleaned]
 
 
 def _caption_single_frame(
@@ -669,23 +652,34 @@ def _caption_single_frame(
 ) -> tuple[str, str, bool, dict[str, Any] | None, list[str]]:
     """Caption a single frame and return caption text, raw output, and metadata."""
     if is_event_gaze_aware:
-        frame_ctx: dict[str, Any] = {
-            "frame_index": int(frame_index),
-            "timestamp_ms": round((start_ns - recording_start_ns) / 1e6),
-            "image_width": image.width,
-            "image_height": image.height,
-            "gaze": {
-                "x": vlm_gaze_x,
-                "y": vlm_gaze_y,
-                "valid": gaze_valid,
-            },
-            "previous_scene_state": previous_scene_state or "Initial frame.",
-            "recent_events": recent_events[-5:],
-        }
-        if custom_instructions:
-            frame_ctx["user_instructions"] = custom_instructions
+        gaze_str = (
+            f"({vlm_gaze_x}, {vlm_gaze_y})"
+            if gaze_valid and vlm_gaze_x is not None and vlm_gaze_y is not None
+            else "unknown"
+        )
+        prev_clean = previous_scene_state.strip()
+        if prev_clean:
+            first_sentence = prev_clean.split(".")[0].strip()
+            bounded_prev = (
+                first_sentence
+                if len(first_sentence) <= 120
+                else first_sentence[:120].rsplit(" ", 1)[0] + "."
+            )
+        else:
+            bounded_prev = "Initial frame."
 
-        user_prompt = json.dumps(frame_ctx, indent=2)
+        prompt_lines = [
+            f"Image dimensions: {image.width}x{image.height}.",
+            f"Wearer gaze position: {gaze_str}.",
+            f"Previous scene state: {bounded_prev}.",
+        ]
+        if recent_events:
+            prompt_lines.append(f"Recent events: {', '.join(recent_events[-3:])}.")
+        if custom_instructions:
+            prompt_lines.append(f"User instructions: {custom_instructions}")
+        prompt_lines.append("Describe the current frame in JSON format.")
+        user_prompt = "\n".join(prompt_lines)
+
         try:
             raw_output = captioner.caption(
                 image,
@@ -825,6 +819,16 @@ class _Captioner:
             raise
 
     def _load_mlx(self) -> None:
+        try:
+            import mlx.core as mx
+
+            if hasattr(mx, "set_cache_limit"):
+                mx.set_cache_limit(128 * 1024 * 1024)
+            elif hasattr(mx, "metal") and hasattr(mx.metal, "set_cache_limit"):
+                mx.metal.set_cache_limit(128 * 1024 * 1024)
+        except Exception:
+            pass
+
         from mlx_vlm import load
         from mlx_vlm.utils import load_config
 
@@ -886,8 +890,18 @@ class _Captioner:
             [str(self._tmp_image)],
             max_tokens=self._max_tokens,
             temperature=0.0,
+            repetition_penalty=1.15,
             verbose=False,
         )
+
+        if "mlx.core" in sys.modules:
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except Exception:
+                pass
+
         # mlx-vlm returns a GenerationResult; older versions returned a str.
         raw = getattr(result, "text", result)
         if system_prompt:
@@ -920,7 +934,10 @@ class _Captioner:
 
         with torch.inference_mode():
             generated = self._model.generate(
-                **inputs, max_new_tokens=self._max_tokens, do_sample=False
+                **inputs,
+                max_new_tokens=self._max_tokens,
+                do_sample=False,
+                repetition_penalty=1.15,
             )
 
         prompt_len = inputs["input_ids"].shape[1]
@@ -2203,8 +2220,8 @@ class VisualContextPlugin(Plugin):
         )
 
         max_tokens = self.max_tokens
-        if is_event_gaze_aware and max_tokens < 200:
-            max_tokens = 200
+        if is_event_gaze_aware and max_tokens < 350:
+            max_tokens = 350
 
         captioner = _Captioner(self._model, max_tokens)
         total = len(indices)
@@ -2299,7 +2316,12 @@ class VisualContextPlugin(Plugin):
                         reference_text,
                     )
                     if not is_no_change and text:
-                        previous_scene_state = text
+                        first_sentence = text.split(".")[0].strip()
+                        previous_scene_state = (
+                            first_sentence
+                            if len(first_sentence) <= 120
+                            else first_sentence[:120].rsplit(" ", 1)[0] + "."
+                        )
                     if new_events:
                         recent_events.extend(new_events)
                     if text and not is_no_change:
