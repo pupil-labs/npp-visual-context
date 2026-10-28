@@ -1608,7 +1608,7 @@ class VisualContextPlugin(Plugin):
 
         self._mcp_settings = MCPSettings()
         self._mcp_settings.changed.connect(self.changed.emit)
-        self._mcp_enabled = False
+        self._mcp_enabled = True
         self._mcp_uvicorn: Any = None
         self._mcp_server_thread: threading.Thread | None = None
         self._mcp_dispatch.connect(lambda fn: fn())
@@ -1737,6 +1737,9 @@ class VisualContextPlugin(Plugin):
     def on_recording_loaded(self, recording: Any) -> None:
         self._captions = []
         self._starts_ns = []
+
+        if self._mcp_enabled:
+            self._start_mcp_server()
 
         # Pass `recording` explicitly so this never depends on when the app
         # swaps `self.recording` over relative to this callback.
