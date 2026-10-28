@@ -9,6 +9,7 @@
 #     "mcp",
 #     "uvicorn",
 #     "mlx-vlm; sys_platform == 'darwin' and platform_machine == 'arm64'",
+#     "typing-extensions>=4.16.0",
 # ]
 #
 # [tool.uv.sources]
