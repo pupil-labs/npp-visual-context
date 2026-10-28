@@ -7,6 +7,7 @@
 #     "numpy",
 #     "pillow",
 #     "mcp",
+#     "uvicorn",
 #     "mlx-vlm; sys_platform == 'darwin' and platform_machine == 'arm64'",
 # ]
 #
