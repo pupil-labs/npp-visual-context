@@ -1,14 +1,17 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm.git; sys_platform == 'darwin' and platform_machine == 'arm64'",
 #     "torch; sys_platform != 'darwin' or platform_machine != 'arm64'",
 #     "transformers>=4.57; sys_platform != 'darwin' or platform_machine != 'arm64'",
 #     "accelerate; sys_platform != 'darwin' or platform_machine != 'arm64'",
 #     "numpy",
 #     "pillow",
 #     "mcp",
+#     "mlx-vlm; sys_platform == 'darwin' and platform_machine == 'arm64'",
 # ]
+#
+# [tool.uv.sources]
+# mlx-vlm = { git = "https://github.com/Blaizzy/mlx-vlm.git" }
 # ///
 
 """Visual Context Plugin -- local VLM scene captioning.
