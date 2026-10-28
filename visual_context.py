@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "mlx-vlm>=0.3.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+#     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm.git; sys_platform == 'darwin' and platform_machine == 'arm64'",
 #     "torch; sys_platform != 'darwin' or platform_machine != 'arm64'",
 #     "transformers>=4.57; sys_platform != 'darwin' or platform_machine != 'arm64'",
 #     "accelerate; sys_platform != 'darwin' or platform_machine != 'arm64'",
@@ -20,10 +20,10 @@ Algorithms:
 - Redundancy skip: mean absolute difference of 64x64 grayscale thumbnails
   against the last frame that was actually captioned (not merely the last
   one sampled, so slow drift still eventually forces a fresh caption).
-- Captioning (Apple Silicon): mlx-vlm running Qwen3-VL Instruct 4-bit on
-  Metal via MLX.
+- Captioning (Apple Silicon): mlx-vlm running LiquidAI/LFM3-VL-2B or
+  Qwen3-VL Instruct 4-bit on Metal via MLX.
 - Captioning (elsewhere): HuggingFace transformers `AutoModelForImageTextToText`
-  running the same Qwen3-VL Instruct checkpoints unquantized.
+  running the same LiquidAI/LFM3-VL-2B or Qwen3-VL Instruct checkpoints unquantized.
 - Timestamps: captions carry absolute nanosecond timestamps taken directly
   from the scene video's own time array, so no epoch normalization is needed.
 """
@@ -196,6 +196,7 @@ class CaptionModel(enum.Enum):
     preset onto the equivalent upstream checkpoint for the transformers path.
     """
 
+    Liquid_2B = "LiquidAI/LFM3-VL-2B-MLX-4bit"
     Fast_2B = "mlx-community/Qwen3-VL-2B-Instruct-4bit"
     Balanced_4B = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
     Quality_8B = "mlx-community/Qwen3-VL-8B-Instruct-4bit"
@@ -207,6 +208,7 @@ class CaptionModel(enum.Enum):
     @property
     def hf_repo(self) -> str:
         return {
+            CaptionModel.Liquid_2B: "LiquidAI/LFM3-VL-2B",
             CaptionModel.Fast_2B: "Qwen/Qwen3-VL-2B-Instruct",
             CaptionModel.Balanced_4B: "Qwen/Qwen3-VL-4B-Instruct",
             CaptionModel.Quality_8B: "Qwen/Qwen3-VL-8B-Instruct",

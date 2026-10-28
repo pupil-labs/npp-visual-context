@@ -45,9 +45,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        choices=["Fast_2B", "Balanced_4B", "Quality_8B"],
+        choices=[m.name for m in CaptionModel],
         default="Fast_2B",
-        help="VLM model preset (default: Fast_2B for speed & memory safety)",
+        help="VLM model preset (choices: Fast_2B, Liquid_2B, Balanced_4B, Quality_8B)",
     )
     parser.add_argument(
         "--template",
@@ -60,6 +60,17 @@ def main() -> None:
         type=float,
         default=2.0,
         help="Seconds between sampled frames (default: 2.0)",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Limit captioning to first N seconds of recording",
+    )
+    parser.add_argument(
+        "--print-all",
+        action="store_true",
+        help="Print all generated captions to stdout",
     )
     parser.add_argument(
         "--no-skip-similar",
@@ -105,6 +116,19 @@ def main() -> None:
     print(f"  Prompt Template: {plugin.prompt_template.value}")
     print(f"  Interval:        {plugin.interval_s}s")
     print(f"  Skip Similar:    {plugin.skip_similar}")
+    if args.duration is not None:
+        orig_validate = plugin._validate_scene_frames
+
+        def _sliced_validate():
+            scene, times_ns, indices = orig_validate()
+            rec_start = recording.start_time
+            sliced = [
+                idx for idx in indices if (times_ns[idx] - rec_start) / 1e9 <= args.duration
+            ]
+            return scene, times_ns, sliced
+
+        plugin._validate_scene_frames = _sliced_validate
+        print(f"  Duration Limit:  {args.duration}s")
 
     # 4. Run generator
     print("\nStarting caption generation...")
@@ -141,7 +165,11 @@ def main() -> None:
             captions = data.get("captions", [])
             print(f"Successfully generated and cached {len(captions)} captions at:")
             print(f"  {cache_file}")
-            if captions:
+            if args.print_all and captions:
+                print("\nAll captions:")
+                for c in captions:
+                    print(f"  [{c['start_s']:5.1f}s]: {c['text']}")
+            elif captions:
                 print("\nSample captions:")
                 for c in captions[:3]:
                     print(f"  [{c['start_s']:.1f}s]: {c['text'][:120]}...")
