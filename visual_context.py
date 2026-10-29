@@ -1,13 +1,19 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "mlx-vlm>=0.3.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
 #     "torch; sys_platform != 'darwin' or platform_machine != 'arm64'",
 #     "transformers>=4.57; sys_platform != 'darwin' or platform_machine != 'arm64'",
 #     "accelerate; sys_platform != 'darwin' or platform_machine != 'arm64'",
 #     "numpy",
 #     "pillow",
+#     "mcp",
+#     "uvicorn",
+#     "mlx-vlm; sys_platform == 'darwin' and platform_machine == 'arm64'",
+#     "typing-extensions>=4.16.0",
 # ]
+#
+# [tool.uv.sources]
+# mlx-vlm = { git = "https://github.com/Blaizzy/mlx-vlm.git" }
 # ///
 
 """Visual Context Plugin -- local VLM scene captioning.
@@ -19,10 +25,10 @@ Algorithms:
 - Redundancy skip: mean absolute difference of 64x64 grayscale thumbnails
   against the last frame that was actually captioned (not merely the last
   one sampled, so slow drift still eventually forces a fresh caption).
-- Captioning (Apple Silicon): mlx-vlm running Qwen3-VL Instruct 4-bit on
-  Metal via MLX.
+- Captioning (Apple Silicon): mlx-vlm running LiquidAI/LFM3-VL-2B or
+  Qwen3-VL Instruct 4-bit on Metal via MLX.
 - Captioning (elsewhere): HuggingFace transformers `AutoModelForImageTextToText`
-  running the same Qwen3-VL Instruct checkpoints unquantized.
+  running the same LiquidAI/LFM3-VL-2B or Qwen3-VL Instruct checkpoints unquantized.
 - Timestamps: captions carry absolute nanosecond timestamps taken directly
   from the scene video's own time array, so no epoch normalization is needed.
 """
@@ -33,28 +39,43 @@ import bisect
 import csv
 import enum
 import gc
+import hashlib
+import html
 import json
 import logging
 import math
+import operator
 import platform
 import re
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Generator
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
-import html
 import numpy as np
 from PIL import Image
 from pupil_labs.neon_player import Plugin, ProgressUpdate, action
 from pupil_labs.neon_player.plugins.events import EventsPlugin
-from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import (
+    QObject,
+    QPointF,
+    QRect,
+    QRectF,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetrics,
+    QGuiApplication,
     QIcon,
     QPainter,
     QPen,
@@ -111,16 +132,46 @@ CAPTION_BAND_HEIGHT = 0.28
 CAPTION_BAND_WIDTH = 0.85
 
 DEFAULT_PROMPT = (
-    "Describe what is visible in this first-person scene camera image in one "
-    "short sentence. Name the main objects, people and activity. Do not "
-    "speculate about anything you cannot see."
+    "In a telegraphic, action-first phrase (under 15 words), describe what is visible and being done in this first-person scene. "
+    "Start directly with an active verb or main objects (e.g. 'Pushing bicycle past brick stairs', 'Sitting at desk typing'). "
+    "Do not use filler phrases or third-person perspective words like 'A person' or 'The image shows'."
+)
+
+EVENT_GAZE_SYSTEM_PROMPT = """\
+You are an event-oriented, gaze-aware visual scene understanding system analyzing sequential frames from a scene camera worn by a person.
+The wearer's gaze position is provided as pixel coordinates (x, y).
+
+Your task is to produce a concise, telegraphic factual update of what is happening right now in the scene.
+
+Rules:
+1. Focus strictly on observable actions, visible objects, and what the wearer is looking at or interacting with.
+2. Limit the scene update to 1 short, telegraphic action-first phrase (under 15 words, e.g. "Holding phone with map next to parked bicycle", "Reaching for door handle to outdoor stairs").
+3. NEVER use filler phrases (do NOT say "The wearer is", "The camera wearer", "A person is", "The environment is", "In this image", "The camera shows", "The person's gaze is on"). Start directly with the action or objects.
+4. Only describe objects that are currently visible. When the scene or environment changes, describe the new scene and do not repeat previous objects.
+5. If the scene, objects, and wearer action are unchanged, return NO_CHANGE.
+6. Output valid JSON in the format:
+{"scene_update": "<telegraphic action phrase>", "gaze_target": "<object or surface at gaze point>", "events": ["<notable action if any>"]}"""
+
+EVENT_GAZE_PROMPT_TEMPLATE = (
+    "Event-oriented, gaze-aware scene understanding with temporal memory. "
+    "Structured frame context (timestamp, resolution, scaled gaze, prior scene "
+    "state, recent events) is injected automatically. Unchanged scenes output "
+    "NO_CHANGE."
 )
 
 PROMPT_TEMPLATES = {
     "Default": DEFAULT_PROMPT,
+    "Gaze & Action": (
+        "In a telegraphic, action-first phrase (under 15 words), describe what is being done or looked at in this first-person scene. "
+        "The gaze point is at ({gaze_x}, {gaze_y}) in this {width}x{height} image. "
+        "Start directly with an active verb or object (e.g. 'Holding phone with map', 'Pushing bicycle up stairs', 'Reaching for door handle'). "
+        "NEVER use filler phrases like 'The wearer', 'The camera wearer', 'A person', 'A first-person view', 'This image shows', or 'The environment is'."
+    ),
+    "Event & Gaze Aware (Temporal)": EVENT_GAZE_PROMPT_TEMPLATE,
     "Gazed Object (One Word)": (
-        "The user's gaze is at pixel coordinates ({gaze_x}, {gaze_y}) in this {width}x{height} image. "
-        "In exactly one word, name the main object at this location. Do not describe anything else."
+        "The user's gaze is at pixel coordinates ({gaze_x}, {gaze_y}) in this "
+        "{width}x{height} image. In exactly one word, name the main object at "
+        "this location. Do not describe anything else."
     ),
     "Detailed Scene": (
         "Provide a highly detailed description of what appears in this scene. "
@@ -132,15 +183,19 @@ PROMPT_TEMPLATES = {
         "Describe only what has changed in this new frame. "
         "Focus on what the wearer is currently doing, what new objects have appeared, "
         "or what objects have disappeared. Keep it brief."
-    )
+    ),
 }
+
 
 class PromptTemplate(enum.Enum):
     Default = "Default"
+    Gaze_Action = "Gaze & Action"
+    Event_Gaze_Aware = "Event & Gaze Aware (Temporal)"
     Gazed_Object = "Gazed Object (One Word)"
     Detailed_Scene = "Detailed Scene"
     Delta_Changes = "Delta Changes"
     Custom = "Custom"
+
 
 #: Leading characters a spreadsheet will interpret as a formula.
 _CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
@@ -157,6 +212,7 @@ class CaptionModel(enum.Enum):
     preset onto the equivalent upstream checkpoint for the transformers path.
     """
 
+    Liquid_2B = "LiquidAI/LFM3-VL-2B-MLX-4bit"
     Fast_2B = "mlx-community/Qwen3-VL-2B-Instruct-4bit"
     Balanced_4B = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
     Quality_8B = "mlx-community/Qwen3-VL-8B-Instruct-4bit"
@@ -168,10 +224,41 @@ class CaptionModel(enum.Enum):
     @property
     def hf_repo(self) -> str:
         return {
+            CaptionModel.Liquid_2B: "LiquidAI/LFM3-VL-2B",
             CaptionModel.Fast_2B: "Qwen/Qwen3-VL-2B-Instruct",
             CaptionModel.Balanced_4B: "Qwen/Qwen3-VL-4B-Instruct",
             CaptionModel.Quality_8B: "Qwen/Qwen3-VL-8B-Instruct",
         }[self]
+
+
+def _settings_cache_key(
+    model: str,
+    prompt: str,
+    interval_s: float,
+    skip_similar: bool,
+    similarity_threshold: float,
+) -> str:
+    """Return a deterministic short SHA-256 hash for a captioning configuration."""
+    raw = (
+        f"{model}|{prompt.strip()}|{interval_s:.3f}|"
+        f"{bool(skip_similar)}|{similarity_threshold:.2f}"
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+
+
+def _cache_filename_for(
+    model: str,
+    prompt: str,
+    interval_s: float,
+    skip_similar: bool,
+    similarity_threshold: float,
+) -> str:
+    """Build the settings-specific cache filename for a model and settings."""
+    key = _settings_cache_key(
+        model, prompt, interval_s, skip_similar, similarity_threshold
+    )
+    model_tag = re.sub(r"[^a-zA-Z0-9_.-]", "_", model.split("/")[-1])
+    return f"visual_context_{model_tag}_{key}.json"
 
 
 def _format_time(seconds: float) -> str:
@@ -288,6 +375,11 @@ def _thumbnail(image: Image.Image) -> np.ndarray:
     return np.asarray(small, dtype=np.int16)
 
 
+def _thumbnail_difference(a: np.ndarray, b: np.ndarray) -> float:
+    """Mean absolute pixel difference between two thumbnails."""
+    return float(np.mean(np.abs(a - b)))
+
+
 #: Boilerplate openers small VLMs like to emit, as (lead, keep_article) pairs.
 #: A lead is only stripped when an article follows it, so a real sentence such
 #: as "The image shows up on the wall behind him" is left alone.
@@ -298,11 +390,32 @@ _BOILERPLATE_LEADS = (
     "this image depicts",
     "the photo shows",
     "this photo shows",
+    "the environment is",
+    "this environment is",
+    "the scene depicts",
+    "the camera is focused on",
+    "the camera shows",
+    "the view shows",
+    "a view of",
 )
 _ARTICLES = ("a ", "an ", "the ")
 
 #: Openers stripped outright, article and all.
-_BOILERPLATE_CLAUSES = ("in this image, ", "in the image, ", "in this photo, ")
+_BOILERPLATE_CLAUSES = (
+    "in this image, ",
+    "in the image, ",
+    "in this photo, ",
+    "in this frame, ",
+    "in this scene, ",
+)
+
+_FILLER_REGEX = re.compile(
+    r"^(in |from )?a first-person (view|perspective)( shows| of| from|,)?\s*"
+    r"|^(the )?(camera )?wearer('s| is| looks| holds| stands| sees)?( now)?( seen| looking at| holding)?\s*"
+    r"|^a person('s| is| holds| stands)?( seen)?( looking at| holding)?\s*"
+    r"|^(this |the )?(image|photo|scene|environment)( shows| depicts| is)?( a| an)?\s*",
+    re.IGNORECASE,
+)
 
 
 def _capitalize(text: str) -> str:
@@ -317,6 +430,8 @@ def _clean_caption(text: Any) -> str:
         return ""
 
     cleaned = " ".join(text.split())
+    # Strip leading subject/perspective filler (e.g. "The camera wearer is looking at...")
+    cleaned = _FILLER_REGEX.sub("", cleaned).strip()
     lowered = cleaned.lower()
 
     for clause in _BOILERPLATE_CLAUSES:
@@ -332,7 +447,16 @@ def _clean_caption(text: Any) -> str:
         if remainder.lower().startswith(_ARTICLES):
             return _capitalize(remainder)
 
-    return cleaned
+    return _capitalize(cleaned)
+
+
+def _clean_event_str(text: Any) -> str:
+    """Strip template placeholders (<...>) and clean VLM boilerplate."""
+    if not isinstance(text, str):
+        return ""
+    # Strip literal prompt placeholders like <object being looked at>
+    stripped = re.sub(r"<[^>]+>", "", text)
+    return _clean_caption(stripped)
 
 
 def _fit_text(
@@ -373,9 +497,10 @@ def _keyword_event_timestamps(
     skipped rather than treated as non-matches, so a single failure in the
     middle of a run does not split it into two events.
     """
-    needle = keyword.strip().lower()
+    needle = keyword.strip()
     if not needle:
         return []
+    pattern = re.compile(rf"\b{re.escape(needle)}\b", re.IGNORECASE)
 
     timestamps: list[int] = []
     previous_matched = False
@@ -383,11 +508,321 @@ def _keyword_event_timestamps(
         text = caption.get("text") or ""
         if not text:
             continue
-        matched = needle in text.lower()
+        matched = bool(pattern.search(text))
         if matched and not previous_matched:
             timestamps.append(int(caption["start_ns"]))
         previous_matched = matched
     return timestamps
+
+
+def _lookup_gaze_point(
+    g_times: np.ndarray | None,
+    g_points_x: np.ndarray | None,
+    g_points_y: np.ndarray | None,
+    timestamp_ns: int,
+    scene_w: int,
+    scene_h: int,
+    target_w: int,
+    target_h: int,
+) -> tuple[int | None, int | None, bool]:
+    """Look up nearest gaze sample and project coordinates into target dimensions."""
+    if (
+        g_times is None
+        or g_points_x is None
+        or g_points_y is None
+        or len(g_times) == 0
+        or scene_w <= 0
+        or scene_h <= 0
+        or target_w <= 0
+        or target_h <= 0
+    ):
+        return None, None, False
+
+    try:
+        idx = int(
+            np.clip(
+                np.searchsorted(g_times, timestamp_ns), 0, len(g_times) - 1
+            )
+        )
+        if idx > 0 and abs(timestamp_ns - g_times[idx - 1]) < abs(
+            timestamp_ns - g_times[idx]
+        ):
+            idx -= 1
+        gx = float(g_points_x[idx])
+        gy = float(g_points_y[idx])
+    except Exception:
+        logger.debug(
+            "Failed gaze lookup at timestamp %s", timestamp_ns, exc_info=True
+        )
+        return None, None, False
+
+    if math.isnan(gx) or math.isnan(gy):
+        return None, None, False
+
+    scale_x = target_w / scene_w
+    scale_y = target_h / scene_h
+    vlm_x = max(0, min(target_w - 1, round(gx * scale_x)))
+    vlm_y = max(0, min(target_h - 1, round(gy * scale_y)))
+    return vlm_x, vlm_y, True
+
+
+def _extract_json_block(text: str) -> str:
+    """Extract candidate JSON payload from model output."""
+    if "```json" in text:
+        return text.split("```json")[1].split("```", maxsplit=1)[0].strip()
+    if "```" in text:
+        return text.split("```")[1].split("```", maxsplit=1)[0].strip()
+    if "{" in text and "}" in text:
+        s_idx = text.find("{")
+        e_idx = text.rfind("}") + 1
+        return text[s_idx:e_idx]
+    return text
+
+
+def _parse_json_event_payload(
+    parsed: dict[str, Any], previous_state: str, raw_text: str
+) -> tuple[str, bool, dict[str, Any], list[str]]:
+    """Extract scene update and events from parsed JSON."""
+    scene_update = parsed.get("scene_update")
+    if scene_update and "NO_CHANGE" in str(scene_update).strip().upper():
+        text = previous_state or "No change."
+        is_no_change = True
+    elif scene_update:
+        text = _clean_event_str(str(scene_update))
+        is_no_change = False
+    else:
+        desc = parsed.get("description", raw_text)
+        text = _clean_event_str(str(desc))
+        is_no_change = False
+
+    new_events: list[str] = []
+    evs = parsed.get("events")
+    if isinstance(evs, list):
+        for ev in evs:
+            if isinstance(ev, dict):
+                d = ev.get("description") or ev.get("type") or str(ev)
+                if d:
+                    cleaned_ev = _clean_event_str(str(d))
+                    if cleaned_ev:
+                        new_events.append(cleaned_ev)
+            elif isinstance(ev, str) and ev.strip():
+                cleaned_ev = _clean_event_str(ev)
+                if cleaned_ev:
+                    new_events.append(cleaned_ev)
+
+    return text, is_no_change, parsed, new_events
+
+
+def _regex_extract_update(text: str) -> str | None:
+    """Fallback regex to extract scene update from truncated or partial JSON."""
+    match = re.search(r'"scene_update"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', text)
+    if not match:
+        match = re.search(r'"description"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', text)
+    if not match:
+        match = re.search(r'"scene_update"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)', text)
+    if not match:
+        match = re.search(r'"description"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)', text)
+    if match:
+        extracted = match.group(1).replace(r'\"', '"').replace(r"\n", " ").strip()
+        # If output was cut off mid-sentence, trim to last complete sentence
+        if extracted and not extracted.endswith((".", "!", "?")):
+            last_period = max(
+                extracted.rfind("."), extracted.rfind("!"), extracted.rfind("?")
+            )
+            if last_period > 10:
+                extracted = extracted[: last_period + 1].strip()
+        cleaned = _clean_event_str(extracted)
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _parse_temporal_response(
+    raw_output: str, previous_scene_state: str
+) -> tuple[str, bool, dict[str, Any] | None, list[str]]:
+    """Parse model output into text, no_change flag, event dict, and new events."""
+    clean_resp = raw_output.strip()
+    clean_upper = clean_resp.upper()
+
+    if (
+        clean_upper == "NO_CHANGE"
+        or clean_upper.rstrip(".").endswith("NO_CHANGE")
+        or clean_upper.startswith("NO_CHANGE")
+    ):
+        return previous_scene_state or "No change.", True, None, []
+
+    # Discard prompt echoes
+    if "frame_index" in clean_resp and "image_width" in clean_resp:
+        return previous_scene_state or "No change.", True, None, []
+
+    json_str = _extract_json_block(clean_resp)
+    try:
+        parsed = json.loads(json_str)
+        if isinstance(parsed, dict):
+            return _parse_json_event_payload(
+                parsed, previous_scene_state, clean_resp
+            )
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    extracted = _regex_extract_update(clean_resp)
+    if extracted:
+        ext_upper = extracted.upper()
+        if (
+            ext_upper == "NO_CHANGE"
+            or ext_upper.startswith("NO_CHANGE")
+            or ext_upper.rstrip(".").endswith("NO_CHANGE")
+        ):
+            return previous_scene_state or "No change.", True, None, []
+        return extracted, False, None, [extracted]
+
+    if clean_resp.startswith("{"):
+        return previous_scene_state or "No change.", True, None, []
+
+    cleaned = _clean_event_str(clean_resp)
+    return cleaned, False, None, [cleaned]
+
+
+def _caption_single_frame(
+    captioner: _Captioner,
+    image: Image.Image,
+    frame_index: int,
+    start_ns: int,
+    recording_start_ns: int,
+    vlm_gaze_x: int | None,
+    vlm_gaze_y: int | None,
+    gaze_valid: bool,
+    is_event_gaze_aware: bool,
+    previous_scene_state: str,
+    recent_events: list[str],
+    custom_instructions: str,
+    legacy_prompt: str,
+    reference_text: str | None,
+) -> tuple[str, str, bool, dict[str, Any] | None, list[str]]:
+    """Caption a single frame and return caption text, raw output, and metadata."""
+    if is_event_gaze_aware:
+        gaze_str = (
+            f"({vlm_gaze_x}, {vlm_gaze_y})"
+            if gaze_valid and vlm_gaze_x is not None and vlm_gaze_y is not None
+            else "unknown"
+        )
+        prev_clean = previous_scene_state.strip()
+        if prev_clean:
+            first_sentence = prev_clean.split(".")[0].strip()
+            bounded_prev = (
+                first_sentence
+                if len(first_sentence) <= 120
+                else first_sentence[:120].rsplit(" ", 1)[0] + "."
+            )
+        else:
+            bounded_prev = "Initial frame."
+
+        prompt_lines = [
+            f"Image dimensions: {image.width}x{image.height}.",
+            f"Wearer gaze position: {gaze_str}.",
+            f"Previous scene state: {bounded_prev}.",
+        ]
+        if recent_events:
+            prompt_lines.append(f"Recent events: {', '.join(recent_events[-3:])}.")
+        if custom_instructions:
+            prompt_lines.append(f"User instructions: {custom_instructions}")
+        prompt_lines.append("Describe the current frame in JSON format.")
+        user_prompt = "\n".join(prompt_lines)
+
+        try:
+            raw_output = captioner.caption(
+                image,
+                user_prompt,
+                system_prompt=EVENT_GAZE_SYSTEM_PROMPT,
+            )
+        except Exception:
+            logger.exception("Captioning failed for scene frame %s", frame_index)
+            return "", "", False, None, []
+
+        text, is_no_change, event_data, new_events = _parse_temporal_response(
+            raw_output, previous_scene_state
+        )
+        return text, raw_output, is_no_change, event_data, new_events
+
+    gaze_str_x = str(vlm_gaze_x) if vlm_gaze_x is not None else "unknown"
+    gaze_str_y = str(vlm_gaze_y) if vlm_gaze_y is not None else "unknown"
+    current_prompt = legacy_prompt.replace("{gaze_x}", gaze_str_x)
+    current_prompt = current_prompt.replace("{gaze_y}", gaze_str_y)
+    current_prompt = current_prompt.replace("{width}", str(image.width))
+    current_prompt = current_prompt.replace("{height}", str(image.height))
+    current_prompt = current_prompt.replace(
+        "{prev_desc}", reference_text or "None"
+    )
+
+    try:
+        raw_output = captioner.caption(image, current_prompt)
+    except Exception:
+        logger.exception("Captioning failed for scene frame %s", frame_index)
+        return "", "", False, None, []
+
+    return raw_output, raw_output, False, None, []
+
+
+def _extract_gaze_timeseries(
+    recording: Any,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Pre-extract gaze time and coordinates as numpy arrays."""
+    gaze = getattr(recording, "gaze", None)
+    if gaze is not None and hasattr(gaze, "time"):
+        try:
+            return (
+                np.asarray(gaze.time),
+                np.asarray(gaze["point_x"]),
+                np.asarray(gaze["point_y"]),
+            )
+        except Exception:
+            logger.debug("Could not extract gaze arrays", exc_info=True)
+    return None, None, None
+
+
+def _render_caption_text(
+    painter: QPainter,
+    bounding_rect: QRect,
+    flags: int,
+    text: str,
+    matching_keywords: list[str],
+    text_color: QColor,
+    highlight_color: QColor,
+) -> None:
+    """Render plain or keyword-highlighted caption text."""
+    if not matching_keywords:
+        painter.setPen(QPen(text_color))
+        painter.drawText(bounding_rect, flags, text)
+        return
+
+    doc = QTextDocument()
+    doc.setDefaultFont(painter.font())
+    doc.setDocumentMargin(0)
+    opt = QTextOption()
+    opt.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+    opt.setWrapMode(QTextOption.WrapMode.WordWrap)
+    doc.setDefaultTextOption(opt)
+    doc.setTextWidth(bounding_rect.width())
+
+    hl_hex = highlight_color.name()
+    text_hex = text_color.name()
+    escaped = html.escape(text)
+    for kw in matching_keywords:
+        escaped = re.sub(
+            rf"\b({re.escape(html.escape(kw))})\b",
+            rf'<span style="color: {hl_hex}; font-weight: bold;">\1</span>',
+            escaped,
+            flags=re.IGNORECASE,
+        )
+    doc.setHtml(
+        f'<div style="text-align: center; color: {text_hex};">'
+        f"{escaped}</div>"
+    )
+
+    painter.save()
+    painter.translate(QPointF(bounding_rect.topLeft()))
+    doc.drawContents(painter)
+    painter.restore()
 
 
 def _csv_safe(value: str) -> str:
@@ -433,6 +868,16 @@ class _Captioner:
             raise
 
     def _load_mlx(self) -> None:
+        try:
+            import mlx.core as mx
+
+            if hasattr(mx, "set_cache_limit"):
+                mx.set_cache_limit(128 * 1024 * 1024)
+            elif hasattr(mx, "metal") and hasattr(mx.metal, "set_cache_limit"):
+                mx.metal.set_cache_limit(128 * 1024 * 1024)
+        except Exception:
+            pass
+
         from mlx_vlm import load
         from mlx_vlm.utils import load_config
 
@@ -454,14 +899,18 @@ class _Captioner:
         self._torch = torch
         self._model, self._processor = model, processor
 
-    def caption(self, image: Image.Image, prompt: str) -> str:
+    def caption(
+        self, image: Image.Image, prompt: str, system_prompt: str | None = None
+    ) -> str:
         if self._model is None or self._processor is None:
             raise RuntimeError("Captioner used before a successful load()")
         if self._mlx:
-            return self._caption_mlx(image, prompt)
-        return self._caption_transformers(image, prompt)
+            return self._caption_mlx(image, prompt, system_prompt=system_prompt)
+        return self._caption_transformers(image, prompt, system_prompt=system_prompt)
 
-    def _caption_mlx(self, image: Image.Image, prompt: str) -> str:
+    def _caption_mlx(
+        self, image: Image.Image, prompt: str, system_prompt: str | None = None
+    ) -> str:
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import apply_chat_template
 
@@ -471,9 +920,18 @@ class _Captioner:
         # file keeps this version-proof at negligible cost next to inference.
         image.save(self._tmp_image, format="JPEG", quality=92)
 
-        formatted = apply_chat_template(
-            self._processor, self._config, prompt, num_images=1
-        )
+        if system_prompt:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ]
+            formatted = apply_chat_template(
+                self._processor, self._config, messages, num_images=1
+            )
+        else:
+            formatted = apply_chat_template(
+                self._processor, self._config, prompt, num_images=1
+            )
         result = generate(
             self._model,
             self._processor,
@@ -481,14 +939,32 @@ class _Captioner:
             [str(self._tmp_image)],
             max_tokens=self._max_tokens,
             temperature=0.0,
+            repetition_penalty=1.15,
             verbose=False,
         )
-        # mlx-vlm returns a GenerationResult; older versions returned a str.
-        return _clean_caption(getattr(result, "text", result))
 
-    def _caption_transformers(self, image: Image.Image, prompt: str) -> str:
+        if "mlx.core" in sys.modules:
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except Exception:
+                pass
+
+        # mlx-vlm returns a GenerationResult; older versions returned a str.
+        raw = getattr(result, "text", result)
+        if system_prompt:
+            return str(raw).strip() if raw is not None else ""
+        return _clean_caption(raw)
+
+    def _caption_transformers(
+        self, image: Image.Image, prompt: str, system_prompt: str | None = None
+    ) -> str:
         torch = self._torch
-        messages = [
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append(
             {
                 "role": "user",
                 "content": [
@@ -496,7 +972,7 @@ class _Captioner:
                     {"type": "text", "text": prompt},
                 ],
             }
-        ]
+        )
         inputs = self._processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -507,15 +983,19 @@ class _Captioner:
 
         with torch.inference_mode():
             generated = self._model.generate(
-                **inputs, max_new_tokens=self._max_tokens, do_sample=False
+                **inputs,
+                max_new_tokens=self._max_tokens,
+                do_sample=False,
+                repetition_penalty=1.15,
             )
 
         prompt_len = inputs["input_ids"].shape[1]
-        return _clean_caption(
-            self._processor.batch_decode(
-                generated[:, prompt_len:], skip_special_tokens=True
-            )[0]
-        )
+        decoded = self._processor.batch_decode(
+            generated[:, prompt_len:], skip_special_tokens=True
+        )[0]
+        if system_prompt:
+            return str(decoded).strip() if decoded is not None else ""
+        return _clean_caption(decoded)
 
     def close(self) -> None:
         self._model = None
@@ -558,8 +1038,24 @@ class CaptionColors(PersistentPropertiesMixin, QObject):
         highlight_color: QColor | str = "#FFD600",
     ) -> None:
         super().__init__()
-        self._text_color = QColor(text_color)
-        self._highlight_color = QColor(highlight_color)
+        if isinstance(text_color, dict):
+            data = text_color
+            text_color = data.get("text_color", "#FFFFFF")
+            highlight_color = data.get("highlight_color", "#FFD600")
+        self._text_color = (
+            QColor(*text_color) if isinstance(text_color, (list, tuple)) else QColor(text_color)
+        )
+        self._highlight_color = (
+            QColor(*highlight_color)
+            if isinstance(highlight_color, (list, tuple))
+            else QColor(highlight_color)
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CaptionColors:
+        inst = cls()
+        inst.__setstate__(data)
+        return inst
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, CaptionColors):
@@ -594,7 +1090,7 @@ class CaptionColorsWidget(PropertyWidget):
     value_changed = Signal(object)
 
     @staticmethod
-    def from_property_impl(prop: property) -> "CaptionColorsWidget":
+    def from_property_impl(prop: property) -> CaptionColorsWidget:
         return CaptionColorsWidget()
 
     def __init__(self) -> None:
@@ -665,11 +1161,19 @@ class CaptionStyle(PersistentPropertiesMixin, QObject):
 
     changed = Signal()
 
-    def __init__(self) -> None:
+    def __init__(self, data: dict[str, Any] | None = None) -> None:
         super().__init__()
         self._font_size = 26
         self._colors = CaptionColors()
         self._colors.changed.connect(self.changed.emit)
+        if isinstance(data, dict):
+            self.__setstate__(data)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CaptionStyle:
+        inst = cls()
+        inst.__setstate__(data)
+        return inst
 
     @property
     @property_params(label="Font Size", min=10, max=100)
@@ -722,14 +1226,15 @@ class CollapsibleGroupWidget(PropertyWidget):
     value_changed = Signal(object)
 
     @staticmethod
-    def from_property_impl(prop: property) -> "CollapsibleGroupWidget":
+    def from_property_impl(prop: property) -> CollapsibleGroupWidget:
         target_type = None
         if hasattr(prop, "fget") and prop.fget:
             try:
                 import typing as T
+
                 target_type = T.get_type_hints(prop.fget).get("return")
-            except Exception:
-                pass
+            except (TypeError, NameError, AttributeError):
+                target_type = None
             if target_type is None or isinstance(target_type, str):
                 hints = getattr(prop.fget, "__annotations__", {})
                 ret = hints.get("return")
@@ -740,24 +1245,36 @@ class CollapsibleGroupWidget(PropertyWidget):
         if target_type is None or not isinstance(target_type, type):
             target_type = object
 
-        params = getattr(prop.fget, "parameters", {}) if hasattr(prop, "fget") and prop.fget else {}
-        title = params.get("label") or (prop.fget.__name__.replace("_", " ").title() if hasattr(prop, "fget") and prop.fget else "")
+        params = (
+            getattr(prop.fget, "parameters", {})
+            if hasattr(prop, "fget") and prop.fget
+            else {}
+        )
+        title = params.get("label") or (
+            prop.fget.__name__.replace("_", " ").title()
+            if hasattr(prop, "fget") and prop.fget
+            else ""
+        )
         return CollapsibleGroupWidget(target_type, title=title)
 
-    def __init__(self, target_type: type, title: str = "", expanded: bool = False) -> None:
+    def __init__(
+        self, target_type: type, title: str = "", expanded: bool = False
+    ) -> None:
         super().__init__()
         self.form = PropertyForm.from_type(target_type)
-        self.expander = Expander(title=title, content_widget=self.form, expanded=expanded)
+        self.expander = Expander(
+            title=title, content_widget=self.form, expanded=expanded
+        )
         self.expander.layout().setContentsMargins(0, 0, 0, 0)
         self.setObjectName("CollapsibleGroupWidget")
         self.setStyleSheet("""
             CollapsibleGroupWidget Expander {
-                padding-top: 0px; 
+                padding-top: 0px;
                 padding-bottom: 0px;
             }
 
             CollapsibleGroupWidget Expander Expander {
-                padding-top: 0px; 
+                padding-top: 0px;
                 padding-bottom: 0px;
             }
 
@@ -767,7 +1284,9 @@ class CollapsibleGroupWidget(PropertyWidget):
         """)
         self.grid_layout.addWidget(self.expander, 0, 0)
         self.form.value_changed.connect(self.value_changed.emit)
-        self.form.property_changed.connect(lambda n, v: self.value_changed.emit(self.value))
+        self.form.property_changed.connect(
+            lambda n, v: self.value_changed.emit(self.value)
+        )
 
     def on_bind(self, instance: Any) -> None:
         super().on_bind(instance)
@@ -808,7 +1327,7 @@ class EditPromptWidget(PropertyWidget):
     value_changed = Signal(object)
 
     @staticmethod
-    def from_property_impl(prop: property) -> "EditPromptWidget":
+    def from_property_impl(prop: property) -> EditPromptWidget:
         return EditPromptWidget()
 
     def __init__(self) -> None:
@@ -845,6 +1364,14 @@ class EditPromptWidget(PropertyWidget):
         pass
 
 
+def _match_prompt_template(text: str) -> str:
+    stripped = text.strip()
+    for k, v in PROMPT_TEMPLATES.items():
+        if stripped == v.strip():
+            return k
+    return "Custom"
+
+
 class CaptioningSettings(PersistentPropertiesMixin, QObject):
     """VLM captioning generation and prompt settings."""
 
@@ -852,27 +1379,39 @@ class CaptioningSettings(PersistentPropertiesMixin, QObject):
 
     def __init__(
         self,
-        prompt: str = DEFAULT_PROMPT,
+        prompt: str | dict[str, Any] = DEFAULT_PROMPT,
         max_tokens: int = 64,
         interval_s: float = 2.0,
         skip_similar: bool = True,
         similarity_threshold: float = 6.0,
     ) -> None:
         super().__init__()
+        if isinstance(prompt, dict):
+            self._prompt = DEFAULT_PROMPT
+            self._max_tokens = max_tokens
+            self._interval_s = interval_s
+            self._skip_similar = skip_similar
+            self._similarity_threshold = similarity_threshold
+            self.__setstate__(prompt)
+            return
         self._prompt = prompt
         self._max_tokens = max_tokens
         self._interval_s = interval_s
         self._skip_similar = skip_similar
         self._similarity_threshold = similarity_threshold
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CaptioningSettings:
+        inst = cls()
+        inst.__setstate__(data)
+        return inst
+
     @property
     @property_params(label="Prompt Template")
     def prompt_template(self) -> PromptTemplate:
-        current = self._prompt.strip()
+        matched = _match_prompt_template(self._prompt)
         for t in PromptTemplate:
-            if t == PromptTemplate.Custom:
-                continue
-            if current == PROMPT_TEMPLATES.get(t.value, "").strip():
+            if t.value == matched:
                 return t
         return PromptTemplate.Custom
 
@@ -961,14 +1500,7 @@ class CaptioningSettings(PersistentPropertiesMixin, QObject):
         combo = QComboBox()
         combo.addItems(list(PROMPT_TEMPLATES.keys()))
         combo.addItem("Custom")
-
-        current = self._prompt.strip()
-        matched_tmpl = "Custom"
-        for k, v in PROMPT_TEMPLATES.items():
-            if current == v.strip():
-                matched_tmpl = k
-                break
-        combo.setCurrentText(matched_tmpl)
+        combo.setCurrentText(_match_prompt_template(self._prompt))
         tmpl_layout.addWidget(combo)
         layout.addLayout(tmpl_layout)
 
@@ -985,15 +1517,7 @@ class CaptioningSettings(PersistentPropertiesMixin, QObject):
         combo.currentTextChanged.connect(on_combo_changed)
 
         def on_text_changed() -> None:
-            current_text = text_edit.toPlainText().strip()
-            matched = False
-            for k, v in PROMPT_TEMPLATES.items():
-                if current_text == v.strip():
-                    combo.setCurrentText(k)
-                    matched = True
-                    break
-            if not matched:
-                combo.setCurrentText("Custom")
+            combo.setCurrentText(_match_prompt_template(text_edit.toPlainText()))
 
         text_edit.textChanged.connect(on_text_changed)
 
@@ -1012,8 +1536,118 @@ class CaptioningSettings(PersistentPropertiesMixin, QObject):
                 self.prompt = text
 
 
+class MCPInfoWidget(PropertyWidget):
+    """Displays MCP endpoint URL and a button to copy configuration."""
+
+    value_changed = Signal(object)
+
+    @staticmethod
+    def from_property_impl(prop: property) -> MCPInfoWidget:
+        return MCPInfoWidget()
+
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(6)
+
+        self.endpoint_label = QLabel("http://127.0.0.1:8765/mcp")
+        self.endpoint_label.setStyleSheet(
+            "font-family: monospace; font-size: 11px;"
+        )
+        layout.addWidget(self.endpoint_label)
+
+        self.btn_copy = QPushButton("Copy Config")
+        self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy.clicked.connect(self._copy_config)
+        layout.addWidget(self.btn_copy)
+
+        self.grid_layout.addLayout(layout, 0, 0)
+        self._target_instance: Any = None
+
+    def on_bind(self, instance: Any) -> None:
+        super().on_bind(instance)
+        self._target_instance = instance
+        self._update_url()
+        if hasattr(instance, "changed") and hasattr(instance.changed, "connect"):
+            instance.changed.connect(self._update_url)
+
+    def _get_port(self) -> int:
+        if self._target_instance and hasattr(self._target_instance, "port"):
+            return getattr(self._target_instance, "port", 8765)
+        return 8765
+
+    def _update_url(self) -> None:
+        port = self._get_port()
+        self.endpoint_label.setText(f"http://127.0.0.1:{port}/mcp")
+
+    def _copy_config(self) -> None:
+        port = self._get_port()
+        config_text = json.dumps(
+            {
+                "mcpServers": {
+                    "neon-visual-context": {
+                        "url": f"http://127.0.0.1:{port}/mcp"
+                    }
+                }
+            },
+            indent=2,
+        )
+        QGuiApplication.clipboard().setText(config_text)
+        self.btn_copy.setText("Copied!")
+        QTimer.singleShot(1500, lambda: self.btn_copy.setText("Copy Config"))
+
+    @property
+    def value(self) -> Any:
+        return None
+
+    @value.setter
+    def value(self, v: Any) -> None:
+        pass
+
+
+class MCPSettings(PersistentPropertiesMixin, QObject):
+    """MCP server configuration and endpoint."""
+
+    changed = Signal()
+
+    def __init__(self, port: int | dict[str, Any] = 8765) -> None:
+        super().__init__()
+        if isinstance(port, dict):
+            self._port = 8765
+            self.__setstate__(port)
+            return
+        self._port = int(port)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MCPSettings:
+        inst = cls()
+        inst.__setstate__(data)
+        return inst
+
+    @property
+    @property_params(label="Server Port", min=1024, max=65535)
+    def port(self) -> int:
+        return self._port
+
+    @port.setter
+    def port(self, v: int) -> None:
+        self._port = int(v)
+        self.changed.emit()
+
+    @property
+    @property_params(label="Endpoint", widget=MCPInfoWidget, dont_encode=True)
+    def endpoint(self) -> None:
+        return None
+
+    @endpoint.setter
+    def endpoint(self, v: Any) -> None:
+        pass
+
+
 class VisualContextPlugin(Plugin):
     label = "Visual Context (Scene Captioning)"
+    _mcp_dispatch = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1026,31 +1660,111 @@ class VisualContextPlugin(Plugin):
         self._show_captions = True
         self._model = CaptionModel.Balanced_4B
         self._settings = CaptioningSettings()
-        self._settings.changed.connect(self.changed.emit)
+        self._settings.changed.connect(self._on_settings_or_model_changed)
 
         self._caption_style = CaptionStyle()
         self._caption_style.changed.connect(self.changed.emit)
         self._bg_color = QColor(0, 0, 0, 160)
 
+        self._mcp_settings = MCPSettings()
+        self._mcp_settings.changed.connect(self.changed.emit)
+        self._mcp_enabled = True
+        self._mcp_uvicorn: Any = None
+        self._mcp_server_thread: threading.Thread | None = None
+        self._mcp_dispatch.connect(
+            self._on_mcp_dispatch, Qt.ConnectionType.QueuedConnection
+        )
+
         self._narrate_captions = False
         self._last_narrated_ns = -1
         try:
             self._tts = QTextToSpeech()
-        except Exception as e:
-            logger.error(f"Failed to initialize TTS: {e}")
+        except Exception:
+            logger.exception("Failed to initialize TTS")
             self._tts = None
+
+    @Slot(object)
+    def _on_mcp_dispatch(self, fn: Any) -> None:
+        fn()
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        ordered = dict(state)
+        for group_key in ("settings", "caption_style", "mcp_settings"):
+            if group_key in ordered:
+                ordered[group_key] = ordered.pop(group_key)
+        super().__setstate__(ordered)
 
     # ------------------------------------------------------------------
     # Cache handling
     # ------------------------------------------------------------------
 
+    def _active_model_repo(self) -> str:
+        """Return the repository ID for the currently selected model preset."""
+        if isinstance(self._model, CaptionModel):
+            return (
+                self._model.mlx_repo
+                if _is_apple_silicon()
+                else self._model.hf_repo
+            )
+        return str(self._model)
+
+    def _current_cache_filename(self) -> str:
+        """Return the settings-hashed cache filename for the active configuration."""
+        return _cache_filename_for(
+            self._active_model_repo(),
+            self.prompt,
+            self.interval_s,
+            self.skip_similar,
+            self.similarity_threshold,
+        )
+
     def _read_cache(self, recording: Any = None) -> dict[str, Any] | None:
+        target_filename = self._current_cache_filename()
         try:
-            data = self.load_cached_json(CACHE_FILENAME, recording=recording)
+            data = self.load_cached_json(target_filename, recording=recording)
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, OSError):
+            logger.exception("Failed to read visual context cache %s", target_filename)
+
+        try:
+            legacy = self.load_cached_json(CACHE_FILENAME, recording=recording)
         except (json.JSONDecodeError, OSError):
             logger.exception("Failed to read visual context cache")
             return None
-        return data if isinstance(data, dict) else None
+
+        if not isinstance(legacy, dict):
+            return None
+
+        if (
+            legacy.get("model") == self._active_model_repo()
+            and str(legacy.get("prompt", "")).strip() == self.prompt.strip()
+            and abs(float(legacy.get("interval_s", -1.0)) - float(self.interval_s))
+            < 1e-3
+        ):
+            if "skip_similar" in legacy and bool(legacy["skip_similar"]) != bool(
+                self.skip_similar
+            ):
+                return None
+            if (
+                self.skip_similar
+                and "similarity_threshold" in legacy
+                and abs(
+                    float(legacy["similarity_threshold"])
+                    - float(self.similarity_threshold)
+                )
+                >= 1e-2
+            ):
+                return None
+            return legacy
+
+        return None
+
+    def _on_settings_or_model_changed(self) -> None:
+        rec = getattr(self, "recording", None)
+        if rec is not None:
+            self.on_recording_loaded(rec)
+        self.changed.emit()
 
     @staticmethod
     def _valid_captions(data: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -1083,16 +1797,22 @@ class VisualContextPlugin(Plugin):
                 "end_s": end_s,
                 "text": text if isinstance(text, str) else "",
                 "frame_index": c.get("frame_index"),
+                "is_no_change": bool(c.get("is_no_change", False)),
+                "raw_output": c.get("raw_output"),
+                "event_data": c.get("event_data"),
             })
 
         # `bisect` in `_caption_at` requires sorted starts; do not trust the
         # file's ordering.
-        cleaned.sort(key=lambda c: c["start_ns"])
+        cleaned.sort(key=operator.itemgetter("start_ns"))
         return cleaned
 
     def on_recording_loaded(self, recording: Any) -> None:
         self._captions = []
         self._starts_ns = []
+
+        if self._mcp_enabled:
+            self._start_mcp_server()
 
         # Pass `recording` explicitly so this never depends on when the app
         # swaps `self.recording` over relative to this callback.
@@ -1108,6 +1828,10 @@ class VisualContextPlugin(Plugin):
         # relocated cache directory can never mislabel another recording.
         if data.get("recording_start_time") != getattr(recording, "start_time", None):
             logger.warning("Visual context cache belongs to a different recording")
+            return
+
+        if "error" in data:
+            # A previous run recorded an error; nothing valid to display
             return
 
         captions = self._valid_captions(data)
@@ -1170,8 +1894,15 @@ class VisualContextPlugin(Plugin):
 
     @model.setter
     def model(self, v: CaptionModel) -> None:
+        if isinstance(v, str):
+            try:
+                v = CaptionModel(v)
+            except ValueError:
+                v = CaptionModel[v]
+        if self._model == v:
+            return
         self._model = v
-        self.changed.emit()
+        self._on_settings_or_model_changed()
 
     @property
     @property_params(
@@ -1188,8 +1919,8 @@ class VisualContextPlugin(Plugin):
             self._settings.__setstate__(value)
         elif isinstance(value, CaptioningSettings):
             self._settings = value
-            self._settings.changed.connect(self.changed.emit)
-        self.changed.emit()
+            self._settings.changed.connect(self._on_settings_or_model_changed)
+        self._on_settings_or_model_changed()
 
     # Backward compatibility proxies
     @property
@@ -1293,6 +2024,56 @@ class VisualContextPlugin(Plugin):
                             keywords.add(kw)
         return keywords
 
+    @property
+    @property_params(
+        primary=True,
+        widget=CollapsibleGroupWidget,
+        label="Model Context Protocol (MCP)",
+        enable_prop="mcp_enabled",
+    )
+    def mcp_settings(self) -> MCPSettings:
+        return self._mcp_settings
+
+    @mcp_settings.setter
+    def mcp_settings(self, value: MCPSettings | dict) -> None:
+        if isinstance(value, dict):
+            self._mcp_settings.__setstate__(value)
+        elif isinstance(value, MCPSettings):
+            self._mcp_settings = value
+            self._mcp_settings.changed.connect(self.changed.emit)
+        self.changed.emit()
+
+    @property
+    @property_params(widget=None)
+    def mcp_enabled(self) -> bool:
+        return self._mcp_enabled
+
+    @mcp_enabled.setter
+    def mcp_enabled(self, v: bool) -> None:
+        enabled = bool(v)
+        if self._mcp_enabled == enabled:
+            return
+        self._mcp_enabled = enabled
+        if self._mcp_enabled:
+            self._start_mcp_server()
+        else:
+            self._stop_mcp_server()
+        self.changed.emit()
+
+    @property
+    @property_params(widget=None, dont_encode=True)
+    def mcp_port(self) -> int:
+        return self._mcp_settings.port
+
+    @mcp_port.setter
+    def mcp_port(self, v: int) -> None:
+        self._mcp_settings.port = v
+
+    def on_disabled(self) -> None:
+        self._stop_mcp_server()
+        if getattr(self, "_tts", None):
+            self._tts.stop()
+
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
@@ -1355,7 +2136,9 @@ class VisualContextPlugin(Plugin):
         if not ok or not keyword.strip():
             return
 
-        events_plugin = EventsPlugin.instance()
+        events_plugin: EventsPlugin | None = (
+            Plugin.get_instance_by_name("EventsPlugin") or EventsPlugin.instance()
+        )
         if events_plugin is None:
             self.app.show_notification("Error", "EventsPlugin not loaded.")
             return
@@ -1370,6 +2153,7 @@ class VisualContextPlugin(Plugin):
             return
 
         events_plugin.add_events({f"Saw: {keyword}": timestamps})
+        _refresh_events_plugin_ui(events_plugin)
         self.app.show_notification(
             "Events Created", f"Added {len(timestamps)} events for '{keyword}'."
         )
@@ -1447,47 +2231,95 @@ class VisualContextPlugin(Plugin):
             "Export Complete", f"Wrote {len(self._captions)} captions."
         )
 
+    def _run_on_main(self, fn: Any, timeout: float = 15.0) -> Any:
+        if QThread.currentThread() == self.thread():
+            return fn()
+        fut: Future[Any] = Future()
+
+        def _work() -> None:
+            try:
+                fut.set_result(fn())
+            except Exception as exc:  # ruff: ignore[blind-except]
+                fut.set_exception(exc)
+
+        self._mcp_dispatch.emit(_work)
+        return fut.result(timeout=timeout)
+
+    def _start_mcp_server(self) -> None:
+        if self._mcp_server_thread is not None and self._mcp_server_thread.is_alive():
+            return
+
+        server = _create_mcp_server(self)
+        if server is None:
+            return
+
+        port = self._mcp_settings.port
+        host = "127.0.0.1"
+        self._mcp_uvicorn = _build_uvicorn_server(server, host, port)
+
+        def _serve() -> None:
+            try:
+                self._mcp_uvicorn.run()
+            except Exception:
+                logger.exception("MCP server stopped with error")
+
+        self._mcp_server_thread = threading.Thread(
+            target=_serve, daemon=True, name="VisualContextMCP"
+        )
+        self._mcp_server_thread.start()
+        logger.info(
+            "VisualContextPlugin MCP server started at http://%s:%s/mcp", host, port
+        )
+
+    def _stop_mcp_server(self) -> None:
+        if self._mcp_uvicorn is not None:
+            self._mcp_uvicorn.should_exit = True
+            self._mcp_uvicorn = None
+        if self._mcp_server_thread is not None:
+            self._mcp_server_thread = None
+        logger.info("VisualContextPlugin MCP server stopped")
+
     # ------------------------------------------------------------------
     # Background work
     # ------------------------------------------------------------------
 
-    def _reuse_caption(
+    # ------------------------------------------------------------------
+    # Background work
+    # ------------------------------------------------------------------
+
+    def _check_similarity_match(
         self,
-        thumb: np.ndarray,
+        image: Image.Image,
+        position: int,
         reference_thumb: np.ndarray | None,
         reference_text: str | None,
-    ) -> str | None:
-        """Return the previous caption if this frame is near-identical to it."""
-        if reference_thumb is None or not reference_text:
-            return None
-        difference = float(np.mean(np.abs(thumb - reference_thumb)))
-        if difference < self.similarity_threshold:
-            return reference_text
-        return None
+        is_event_gaze_aware: bool,
+        previous_scene_state: str,
+    ) -> tuple[np.ndarray | None, str | None, bool, str]:
+        """Check if frame matches reference.
 
-    def _record_failure(self, message: str) -> None:
-        """Persist an error so `_on_captions_ready` can surface it.
-
-        A background job that raises is reported to the UI as a successful
-        completion, so without this the user is told a failed run worked.
+        Returns (thumb, text, is_no_change, raw_output).
         """
-        try:
-            self.save_cached_json(
-                CACHE_FILENAME,
-                {
-                    "version": CACHE_VERSION,
-                    "recording_start_time": self.recording.start_time,
-                    "error": message,
-                },
-            )
-        except OSError:
-            logger.exception("Could not record the captioning failure")
+        if not self.skip_similar or position == 0:
+            return None, None, False, ""
+        thumb = _thumbnail(image)
+        if (
+            reference_thumb is not None
+            and _thumbnail_difference(thumb, reference_thumb)
+            <= self.similarity_threshold
+        ):
+            if is_event_gaze_aware:
+                return (
+                    thumb,
+                    previous_scene_state or "No change.",
+                    True,
+                    "NO_CHANGE",
+                )
+            return thumb, reference_text, False, ""
+        return thumb, None, False, ""
 
-    def bg_generate_captions(self) -> Generator[ProgressUpdate, None, None]:
-        # NB: `ProgressUpdate`'s second field is `datum`, which nothing in the
-        # app reads, so only the fraction is reported.
-        yield ProgressUpdate(0.0)
-
+    def _validate_scene_frames(self) -> tuple[Any, np.ndarray, list[int]]:
+        """Validate scene video presence and frame sample indices."""
         scene = getattr(self.recording, "scene", None)
         if scene is None or len(scene) == 0:
             self._record_failure("This recording has no scene video to caption.")
@@ -1498,8 +2330,99 @@ class VisualContextPlugin(Plugin):
         if not indices:
             self._record_failure("Could not select any scene frames to caption.")
             raise RuntimeError("Could not select any scene frames to caption")
+        return scene, times_ns, indices
 
-        captioner = _Captioner(self._model, self.max_tokens)
+    def _record_failure(self, message: str) -> None:
+        """Persist an error so `_on_captions_ready` can surface it.
+
+        A background job that raises is reported to the UI as a successful
+        completion, so without this the user is told a failed run worked.
+        """
+        payload = {
+            "version": CACHE_VERSION,
+            "recording_start_time": self.recording.start_time,
+            "model": self._active_model_repo(),
+            "prompt": self.prompt,
+            "interval_s": self.interval_s,
+            "skip_similar": self.skip_similar,
+            "similarity_threshold": self.similarity_threshold,
+            "error": message,
+        }
+        try:
+            target_filename = self._current_cache_filename()
+            existing = self.load_cached_json(target_filename)
+            if not (isinstance(existing, dict) and existing.get("captions")):
+                self.save_cached_json(target_filename, payload)
+            self.save_cached_json(CACHE_FILENAME, payload)
+        except OSError:
+            logger.exception("Could not record the captioning failure")
+
+    def _finalize_captions(
+        self,
+        captions: list[dict[str, Any]],
+        times_ns: np.ndarray,
+        total: int,
+        t_start: float,
+        reused: int,
+        captioner: _Captioner,
+    ) -> None:
+        """Validate, timestamp, cache and log completed captions."""
+        if not any(c["text"] for c in captions):
+            message = (
+                f"The model produced no usable caption for any of the {total} "
+                "sampled frames. See the log for details."
+            )
+            self._record_failure(message)
+            raise RuntimeError(message)
+
+        _assign_end_times(captions, times_ns, self.recording.start_time)
+        payload = {
+            "version": CACHE_VERSION,
+            "recording_start_time": self.recording.start_time,
+            "model": captioner.repo,
+            "backend": captioner.backend,
+            "prompt": self.prompt,
+            "interval_s": self.interval_s,
+            "skip_similar": self.skip_similar,
+            "similarity_threshold": self.similarity_threshold,
+            "captions": captions,
+            "total_time_s": time.time() - t_start,
+        }
+        cache_filename = _cache_filename_for(
+            captioner.repo,
+            self.prompt,
+            self.interval_s,
+            self.skip_similar,
+            self.similarity_threshold,
+        )
+        self.save_cached_json(cache_filename, payload)
+        self.save_cached_json(CACHE_FILENAME, payload)
+        logger.info(
+            "Captioned %d scene frames (%d reused from near-identical frames) -> %s",
+            len(captions),
+            reused,
+            cache_filename,
+        )
+
+    def bg_generate_captions(self) -> Generator[ProgressUpdate, None, None]:
+        # NB: `ProgressUpdate`'s second field is `datum`, which nothing in the
+        # app reads, so only the fraction is reported.
+        yield ProgressUpdate(0.0)
+
+        scene, times_ns, indices = self._validate_scene_frames()
+
+        is_event_gaze_aware = (
+            self.prompt_template == PromptTemplate.Event_Gaze_Aware
+            or "temporal memory" in self.prompt.lower()
+            or "event-oriented" in self.prompt.lower()
+            or "EVENT_GAZE_SYSTEM_PROMPT" in self.prompt
+        )
+
+        max_tokens = self.max_tokens
+        if is_event_gaze_aware and max_tokens < 350:
+            max_tokens = 350
+
+        captioner = _Captioner(self._model, max_tokens)
         total = len(indices)
 
         try:
@@ -1514,99 +2437,116 @@ class VisualContextPlugin(Plugin):
                 raise
 
             captions: list[dict[str, Any]] = []
-            # The reference is the last frame actually sent to the VLM, not
-            # the last frame sampled, so slow drift still accumulates until it
-            # crosses the threshold and forces a fresh caption.
             reference_thumb: np.ndarray | None = None
             reference_text: str | None = None
+            previous_scene_state = ""
+            recent_events: list[str] = []
             reused = 0
+
+            scene_w = getattr(scene, "width", None) or 1600
+            scene_h = getattr(scene, "height", None) or 1200
+            g_times, g_points_x, g_points_y = _extract_gaze_timeseries(
+                self.recording
+            )
+
+            custom_instructions = ""
+            if (
+                is_event_gaze_aware
+                and self.prompt.strip()
+                != PROMPT_TEMPLATES["Event & Gaze Aware (Temporal)"].strip()
+            ):
+                custom_instructions = self.prompt.strip()
 
             for position, frame_index in enumerate(indices):
                 image = _frame_to_pil(scene[frame_index].bgr)
+                start_ns = int(times_ns[frame_index])
 
-                thumb: np.ndarray | None = None
-                text: str | None = None
-                if self.skip_similar:
-                    thumb = _thumbnail(image)
-                    text = self._reuse_caption(thumb, reference_thumb, reference_text)
-                    reused += text is not None
+                vlm_gaze_x, vlm_gaze_y, gaze_valid = _lookup_gaze_point(
+                    g_times,
+                    g_points_x,
+                    g_points_y,
+                    start_ns,
+                    scene_w,
+                    scene_h,
+                    image.width,
+                    image.height,
+                )
+
+                event_data: dict[str, Any] | None = None
+
+                (
+                    thumb,
+                    text,
+                    is_no_change,
+                    raw_output,
+                ) = self._check_similarity_match(
+                    image,
+                    position,
+                    reference_thumb,
+                    reference_text,
+                    is_event_gaze_aware,
+                    previous_scene_state,
+                )
+                if text is not None:
+                    reused += 1
 
                 t0 = time.time()
                 if text is None:
-                    try:
-                        # Find nearest gaze coordinates
-                        gaze = getattr(self.recording, "gaze", None)
-                        gaze_x, gaze_y = "unknown", "unknown"
-                        start_ns = int(times_ns[frame_index])
-                        if gaze is not None and hasattr(gaze, "time"):
-                            g_times = np.asarray(gaze.time)
-                            if len(g_times) > 0:
-                                idx = np.clip(np.searchsorted(g_times, start_ns), 0, len(g_times) - 1)
-                                gaze_x = float(np.asarray(gaze["point_x"])[idx])
-                                gaze_y = float(np.asarray(gaze["point_y"])[idx])
-
-                        # Inject variables using string replace
-                        current_prompt = self.prompt
-                        current_prompt = current_prompt.replace("{gaze_x}", f"{gaze_x:.1f}" if isinstance(gaze_x, float) else gaze_x)
-                        current_prompt = current_prompt.replace("{gaze_y}", f"{gaze_y:.1f}" if isinstance(gaze_y, float) else gaze_y)
-                        current_prompt = current_prompt.replace("{width}", str(image.width))
-                        current_prompt = current_prompt.replace("{height}", str(image.height))
-                        current_prompt = current_prompt.replace("{prev_desc}", reference_text or "None")
-
-                        text = captioner.caption(image, current_prompt)
-                    except Exception:
-                        logger.exception(
-                            "Captioning failed for scene frame %s", frame_index
+                    (
+                        text,
+                        raw_output,
+                        is_no_change,
+                        event_data,
+                        new_events,
+                    ) = _caption_single_frame(
+                        captioner,
+                        image,
+                        frame_index,
+                        start_ns,
+                        self.recording.start_time,
+                        vlm_gaze_x,
+                        vlm_gaze_y,
+                        gaze_valid,
+                        is_event_gaze_aware,
+                        previous_scene_state,
+                        recent_events,
+                        custom_instructions,
+                        self.prompt,
+                        reference_text,
+                    )
+                    if not is_no_change and text:
+                        first_sentence = text.split(".")[0].strip()
+                        previous_scene_state = (
+                            first_sentence
+                            if len(first_sentence) <= 120
+                            else first_sentence[:120].rsplit(" ", 1)[0] + "."
                         )
-                        text = ""
-                    if text:
+                    if new_events:
+                        recent_events.extend(new_events)
+                    if text and not is_no_change:
                         reference_text = text
-                        reference_thumb = thumb
-                t1 = time.time()
-                processing_time_s = t1 - t0
+                        reference_thumb = (
+                            thumb if thumb is not None else _thumbnail(image)
+                        )
 
-                start_ns = int(times_ns[frame_index])
+                processing_time_s = time.time() - t0
+
                 captions.append({
                     "frame_index": int(frame_index),
                     "start_ns": start_ns,
                     "start_s": (start_ns - self.recording.start_time) / 1e9,
-                    "text": text,
+                    "text": text or "",
+                    "raw_output": raw_output,
+                    "is_no_change": is_no_change,
+                    "event_data": event_data,
                     "processing_time_s": processing_time_s,
                 })
 
                 yield ProgressUpdate(0.02 + 0.93 * (position + 1) / total)
 
-            # Covers both raised errors and a backend that quietly returns
-            # nothing; either way there is no result worth caching.
-            if not any(c["text"] for c in captions):
-                message = (
-                    f"The model produced no usable caption for any of the {total} "
-                    "sampled frames. See the log for details."
-                )
-                self._record_failure(message)
-                raise RuntimeError(message)
-
-            _assign_end_times(captions, times_ns, self.recording.start_time)
-
             yield ProgressUpdate(0.97)
-            self.save_cached_json(
-                CACHE_FILENAME,
-                {
-                    "version": CACHE_VERSION,
-                    "recording_start_time": self.recording.start_time,
-                    "model": captioner.repo,
-                    "backend": captioner.backend,
-                    "prompt": self.prompt,
-                    "interval_s": self.interval_s,
-                    "captions": captions,
-                    "total_time_s": time.time() - t_start,
-                },
-            )
-
-            logger.info(
-                "Captioned %d scene frames (%d reused from near-identical frames)",
-                len(captions),
-                reused,
+            self._finalize_captions(
+                captions, times_ns, total, t_start, reused, captioner
             )
             yield ProgressUpdate(1.0)
 
@@ -1645,11 +2585,15 @@ class VisualContextPlugin(Plugin):
         if not text:
             return
 
-        # Trigger TTS if a new caption appears
-        if getattr(self, "_narrate_captions", False) and getattr(self, "_tts", None):
-            if caption["start_ns"] != self._last_narrated_ns:
-                self._last_narrated_ns = caption["start_ns"]
-                self._tts.stop() # Interrupt previous speech
+        # Trigger TTS if a new caption appears (and is not an unchanged frame)
+        if (
+            getattr(self, "_narrate_captions", False)
+            and getattr(self, "_tts", None)
+            and caption["start_ns"] != self._last_narrated_ns
+        ):
+            self._last_narrated_ns = caption["start_ns"]
+            if not caption.get("is_no_change", False):
+                self._tts.stop()  # Interrupt previous speech
                 self._tts.say(text)
 
         scene_width = self.recording.scene.width
@@ -1696,37 +2640,256 @@ class VisualContextPlugin(Plugin):
                 for kw in self._get_saw_keywords()
                 if re.search(rf"\b{re.escape(kw)}\b", text, re.IGNORECASE)
             ]
-
-            if matching_keywords:
-                doc = QTextDocument()
-                doc.setDefaultFont(painter.font())
-                doc.setDocumentMargin(0)
-                opt = QTextOption()
-                opt.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-                opt.setWrapMode(QTextOption.WrapMode.WordWrap)
-                doc.setDefaultTextOption(opt)
-                doc.setTextWidth(bounding_rect.width())
-
-                hl_hex = self.highlight_color.name()
-                text_hex = self.text_color.name()
-                escaped = html.escape(text)
-                for kw in matching_keywords:
-                    escaped = re.sub(
-                        rf"\b({re.escape(html.escape(kw))})\b",
-                        rf'<span style="color: {hl_hex}; font-weight: bold;">\1</span>',
-                        escaped,
-                        flags=re.IGNORECASE,
-                    )
-                doc.setHtml(
-                    f'<div style="text-align: center; color: {text_hex};">{escaped}</div>'
-                )
-
-                painter.save()
-                painter.translate(QPointF(bounding_rect.topLeft()))
-                doc.drawContents(painter)
-                painter.restore()
-            else:
-                painter.setPen(QPen(self.text_color))
-                painter.drawText(bounding_rect, flags, text)
+            _render_caption_text(
+                painter,
+                bounding_rect,
+                flags,
+                text,
+                matching_keywords,
+                self.text_color,
+                self.highlight_color,
+            )
         finally:
             painter.restore()
+
+
+# ----------------------------------------------------------------------
+# MCP Server Implementation & Tool Registration
+# ----------------------------------------------------------------------
+
+
+def _create_mcp_server(plugin: VisualContextPlugin) -> Any:
+    try:
+        try:
+            from mcp.server.mcpserver import MCPServer
+        except ImportError:
+            from mcp.server.fastmcp import FastMCP as MCPServer
+    except ImportError as exc:
+        logger.warning("MCP server dependencies not available: %s", exc)
+        if plugin.app:
+            plugin.app.show_notification(
+                "MCP Server",
+                "Dependencies not installed. Launch Neon Player to install them.",
+            )
+        return None
+
+    server = MCPServer("neon-visual-context")
+    _register_mcp_tools(server, plugin)
+    return server
+
+
+def _build_uvicorn_server(server: Any, host: str, port: int) -> Any:
+    import uvicorn
+
+    if hasattr(server, "streamable_http_app"):
+        app = server.streamable_http_app(streamable_http_path="/mcp")
+    elif hasattr(server, "sse_app"):
+        app = server.sse_app()
+    else:
+        raise RuntimeError("Unsupported MCP server implementation")
+
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    return uvicorn.Server(config)
+
+
+def _reg_captions(server: Any, plugin: VisualContextPlugin) -> None:
+    @server.tool()
+    def get_captions(
+        start_s: float | None = None,
+        end_s: float | None = None,
+        search: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get scene captions with timestamps and gaze info."""
+        results = []
+        for c in plugin._captions:
+            if start_s is not None and c["start_s"] < start_s:
+                continue
+            if end_s is not None and c["end_s"] > end_s:
+                continue
+            if search is not None and search.lower() not in c["text"].lower():
+                continue
+            results.append({
+                "start_ns": c["start_ns"],
+                "end_ns": c["end_ns"],
+                "start_s": round(float(c["start_s"]), 3),
+                "end_s": round(float(c["end_s"]), 3),
+                "text": c["text"],
+                "frame_index": c.get("frame_index"),
+                "event_data": c.get("event_data", {}),
+            })
+        return results
+
+    @server.tool()
+    def export_captions_csv(path: str) -> str:
+        """Export all loaded captions to a CSV file at the specified path."""
+        def _action() -> str:
+            if not plugin._captions:
+                return "No captions to export."
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "start timestamp [ns]",
+                    "end timestamp [ns]",
+                    "start time [s]",
+                    "end time [s]",
+                    "frame index",
+                    "caption",
+                ])
+                for c in plugin._captions:
+                    writer.writerow([
+                        c["start_ns"],
+                        c["end_ns"],
+                        f"{c['start_s']:.3f}",
+                        f"{c['end_s']:.3f}",
+                        c.get("frame_index", ""),
+                        _csv_safe(c["text"]),
+                    ])
+            return f"Exported {len(plugin._captions)} captions to {path}"
+
+        return plugin._run_on_main(_action)
+
+
+def _refresh_events_plugin_ui(events_plugin: Any) -> None:
+    """Ensure EventsPlugin sidebar widget reflects newly added event types."""
+    try:
+        prop = getattr(type(events_plugin), "event_types", None)
+        if hasattr(prop, "binds"):
+            for widget in prop.binds.get(events_plugin, []):
+                widget.value = events_plugin.event_types
+    except Exception:
+        logger.debug("Could not refresh EventsPlugin widget", exc_info=True)
+
+
+def _resolve_event_timestamp_ns(
+    raw_ts: int | float | str, plugin: VisualContextPlugin
+) -> int:
+    """Convert relative seconds or nanosecond timestamp to exact recording ns."""
+    rec = getattr(plugin, "recording", None)
+    rec_start = int(getattr(rec, "start_time", 0) or 0)
+    val = float(raw_ts) if isinstance(raw_ts, float) else int(str(raw_ts).strip())
+    if isinstance(val, float) or val < 1_000_000_000_000:
+        ts_ns = rec_start + int(float(raw_ts) * 1e9)
+    else:
+        ts_ns = int(val)
+
+    # Snap to exact caption start_ns if within 10 microseconds (handles JSON float64 rounding)
+    if plugin._starts_ns:
+        idx = bisect.bisect_left(plugin._starts_ns, ts_ns)
+        for candidate_idx in (idx - 1, idx):
+            if 0 <= candidate_idx < len(plugin._starts_ns):
+                cand = plugin._starts_ns[candidate_idx]
+                if abs(cand - ts_ns) <= 10_000:
+                    return int(cand)
+    return ts_ns
+
+
+def _reg_events(server: Any, plugin: VisualContextPlugin) -> None:
+    @server.tool()
+    def add_events(events: dict[str, list[int | float | str]]) -> str:
+        """Add custom timeline events {event_name: [timestamp_ns_or_relative_s, ...]}."""
+        def _action() -> str:
+            events_plugin = (
+                Plugin.get_instance_by_name("EventsPlugin") or EventsPlugin.instance()
+            )
+            if events_plugin is None:
+                raise RuntimeError("EventsPlugin is not loaded in Neon Player.")
+            cleaned = {
+                str(name): [
+                    _resolve_event_timestamp_ns(ts, plugin) for ts in timestamps
+                ]
+                for name, timestamps in events.items()
+            }
+            events_plugin.add_events(cleaned)
+            _refresh_events_plugin_ui(events_plugin)
+            summary = {k: len(v) for k, v in cleaned.items()}
+            total = sum(summary.values())
+            if getattr(plugin, "app", None) is not None:
+                names = ", ".join(f"'{k}' ({v})" for k, v in summary.items())
+                plugin.app.show_notification(
+                    "Events Created", f"Added {total} events: {names}."
+                )
+            return f"Successfully added events: {summary}"
+
+        return plugin._run_on_main(_action)
+
+    @server.tool()
+    def create_events_from_keyword(keyword: str) -> str:
+        """Search captions for keyword and add 'Saw: <keyword>' events."""
+        def _action() -> str:
+            events_plugin = (
+                Plugin.get_instance_by_name("EventsPlugin") or EventsPlugin.instance()
+            )
+            if events_plugin is None:
+                raise RuntimeError("EventsPlugin is not loaded in Neon Player.")
+            kw = keyword.strip()
+            timestamps = _keyword_event_timestamps(plugin._captions, kw)
+            if not timestamps:
+                if getattr(plugin, "app", None) is not None:
+                    plugin.app.show_notification(
+                        "No Matches", f"No caption contains '{kw}'."
+                    )
+                return f"No captions contain '{kw}'."
+            event_name = f"Saw: {kw}"
+            events_plugin.add_events({event_name: timestamps})
+            _refresh_events_plugin_ui(events_plugin)
+            if getattr(plugin, "app", None) is not None:
+                plugin.app.show_notification(
+                    "Events Created", f"Added {len(timestamps)} events for '{kw}'."
+                )
+            return f"Added {len(timestamps)} events for '{kw}' ({event_name})."
+
+        return plugin._run_on_main(_action)
+
+
+def _reg_lifecycle(server: Any, plugin: VisualContextPlugin) -> None:
+    @server.tool()
+    def generate_captions(
+        prompt: str | None = None, interval_s: float | None = None
+    ) -> str:
+        """Trigger caption generation in Neon Player for the current recording."""
+        def _action() -> str:
+            if prompt is not None:
+                plugin.prompt = prompt
+            if interval_s is not None:
+                plugin.interval_s = interval_s
+            plugin.generate_captions()
+            return "Started caption generation background job."
+
+        return plugin._run_on_main(_action)
+
+    @server.tool()
+    def get_plugin_status() -> dict[str, Any]:
+        """Get current status of VisualContextPlugin, loaded recording, and settings."""
+        rec = plugin.recording
+        rec_name = (
+            getattr(rec, "name", None)
+            or (rec._rec_dir.name if rec and hasattr(rec, "_rec_dir") else None)
+        )
+        job = getattr(plugin, "_job", None)
+        is_running = (
+            job is not None
+            and getattr(job, "is_running", lambda: False)()
+        )
+        port = plugin._mcp_settings.port
+        return {
+            "recording_loaded": rec is not None,
+            "recording_name": rec_name,
+            "caption_count": len(plugin._captions),
+            "is_captioning_running": is_running,
+            "model": (
+                plugin.model.value
+                if hasattr(plugin.model, "value")
+                else str(plugin.model)
+            ),
+            "prompt": plugin.prompt,
+            "interval_s": plugin.interval_s,
+            "mcp_url": f"http://127.0.0.1:{port}/mcp",
+        }
+
+
+def _register_mcp_tools(server: Any, plugin: VisualContextPlugin) -> None:
+    _reg_captions(server, plugin)
+    _reg_events(server, plugin)
+    _reg_lifecycle(server, plugin)
