@@ -68,11 +68,11 @@ Available **Prompt Templates**:
 
 | Template | Description |
 |---|---|
+| `Detailed Scene` *(default)* | Comprehensive description of visible objects, text, and environmental details. |
 | `Default` | Telegraphic, action-first phrase (<15 words) describing what is visible and being done in the scene. |
 | `Gaze & Action` | Telegraphic, action-first phrase (<15 words) incorporating the exact pixel gaze coordinates `({gaze_x}, {gaze_y})`. |
-| `Event & Gaze Aware (Temporal)` *(default)* | Structured JSON scene understanding with temporal memory (injects gaze coordinates, bounded prior scene state, and recent events; emits `NO_CHANGE` when the scene and action are unchanged). |
+| `Event & Gaze Aware (Temporal)` | Structured JSON scene understanding with temporal memory (injects gaze coordinates, bounded prior scene state, and recent events; emits `NO_CHANGE` when the scene and action are unchanged). |
 | `Gazed Object (One Word)` | Names the main object at the gaze point `({gaze_x}, {gaze_y})` in a single word. |
-| `Detailed Scene` | Comprehensive description of visible objects, text, and environmental details. |
 | `Delta Changes` | Compares against `{prev_desc}` and describes only what changed in the new frame. |
 | `Custom` | User-defined prompt supporting `{gaze_x}`, `{gaze_y}`, `{width}`, `{height}`, and `{prev_desc}` placeholders. |
 
@@ -158,7 +158,7 @@ neon-player "/path/to/recording" \
 | Show Captions | on | Overlay captions during playback. |
 | Narrate Captions (TTS) | off | Speak new captions aloud during playback. |
 | VLM Model | Balanced (4B) | `Liquid_2B`, `Fast_2B`, `Balanced_4B`, or `Quality_8B`. |
-| Prompt Template | Event & Gaze Aware (Temporal) | Preset prompt strategy or `Custom`. |
+| Prompt Template | Detailed Scene | Preset prompt strategy or `Custom`. |
 | Seconds Between Captions | 2.0 | Lower is more detailed and slower (down to `0.1`s). |
 | Max Tokens per Caption | 64 | Upper bound on caption length (automatically raised to 350 for structured JSON temporal mode). |
 | Skip Near-Identical Frames | on | Reuses the previous caption when the scene has barely changed, instead of re-running the model. |

@@ -159,7 +159,14 @@ EVENT_GAZE_PROMPT_TEMPLATE = (
     "NO_CHANGE."
 )
 
+DETAILED_SCENE_PROMPT = (
+    "Provide a highly detailed description of what appears in this scene. "
+    "Name all visible objects, text, and environmental details. "
+    "Avoid first-person perspective phrasing."
+)
+
 PROMPT_TEMPLATES = {
+    "Detailed Scene": DETAILED_SCENE_PROMPT,
     "Default": DEFAULT_PROMPT,
     "Gaze & Action": (
         "In a telegraphic, action-first phrase (under 15 words), describe what is being done or looked at in this first-person scene. "
@@ -173,11 +180,6 @@ PROMPT_TEMPLATES = {
         "{width}x{height} image. In exactly one word, name the main object at "
         "this location. Do not describe anything else."
     ),
-    "Detailed Scene": (
-        "Provide a highly detailed description of what appears in this scene. "
-        "Name all visible objects, text, and environmental details. "
-        "Avoid first-person perspective phrasing."
-    ),
     "Delta Changes": (
         "The previous frame was described as: '{prev_desc}'.\n"
         "Describe only what has changed in this new frame. "
@@ -188,11 +190,11 @@ PROMPT_TEMPLATES = {
 
 
 class PromptTemplate(enum.Enum):
+    Detailed_Scene = "Detailed Scene"
     Default = "Default"
     Gaze_Action = "Gaze & Action"
     Event_Gaze_Aware = "Event & Gaze Aware (Temporal)"
     Gazed_Object = "Gazed Object (One Word)"
-    Detailed_Scene = "Detailed Scene"
     Delta_Changes = "Delta Changes"
     Custom = "Custom"
 
@@ -1379,7 +1381,7 @@ class CaptioningSettings(PersistentPropertiesMixin, QObject):
 
     def __init__(
         self,
-        prompt: str | dict[str, Any] = DEFAULT_PROMPT,
+        prompt: str | dict[str, Any] = DETAILED_SCENE_PROMPT,
         max_tokens: int = 64,
         interval_s: float = 2.0,
         skip_similar: bool = True,
@@ -1387,7 +1389,7 @@ class CaptioningSettings(PersistentPropertiesMixin, QObject):
     ) -> None:
         super().__init__()
         if isinstance(prompt, dict):
-            self._prompt = DEFAULT_PROMPT
+            self._prompt = DETAILED_SCENE_PROMPT
             self._max_tokens = max_tokens
             self._interval_s = interval_s
             self._skip_similar = skip_similar
@@ -1434,7 +1436,7 @@ class CaptioningSettings(PersistentPropertiesMixin, QObject):
     @prompt.setter
     def prompt(self, v: str) -> None:
         text = str(v).strip()
-        self._prompt = text or DEFAULT_PROMPT
+        self._prompt = text or DETAILED_SCENE_PROMPT
         self.changed.emit()
 
     @property
