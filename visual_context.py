@@ -60,7 +60,17 @@ import numpy as np
 from PIL import Image
 from pupil_labs.neon_player import Plugin, ProgressUpdate, action
 from pupil_labs.neon_player.plugins.events import EventsPlugin
-from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import (
+    QObject,
+    QPointF,
+    QRect,
+    QRectF,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -487,9 +497,10 @@ def _keyword_event_timestamps(
     skipped rather than treated as non-matches, so a single failure in the
     middle of a run does not split it into two events.
     """
-    needle = keyword.strip().lower()
+    needle = keyword.strip()
     if not needle:
         return []
+    pattern = re.compile(rf"\b{re.escape(needle)}\b", re.IGNORECASE)
 
     timestamps: list[int] = []
     previous_matched = False
@@ -497,7 +508,7 @@ def _keyword_event_timestamps(
         text = caption.get("text") or ""
         if not text:
             continue
-        matched = needle in text.lower()
+        matched = bool(pattern.search(text))
         if matched and not previous_matched:
             timestamps.append(int(caption["start_ns"]))
         previous_matched = matched
@@ -1027,8 +1038,24 @@ class CaptionColors(PersistentPropertiesMixin, QObject):
         highlight_color: QColor | str = "#FFD600",
     ) -> None:
         super().__init__()
-        self._text_color = QColor(text_color)
-        self._highlight_color = QColor(highlight_color)
+        if isinstance(text_color, dict):
+            data = text_color
+            text_color = data.get("text_color", "#FFFFFF")
+            highlight_color = data.get("highlight_color", "#FFD600")
+        self._text_color = (
+            QColor(*text_color) if isinstance(text_color, (list, tuple)) else QColor(text_color)
+        )
+        self._highlight_color = (
+            QColor(*highlight_color)
+            if isinstance(highlight_color, (list, tuple))
+            else QColor(highlight_color)
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CaptionColors:
+        inst = cls()
+        inst.__setstate__(data)
+        return inst
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, CaptionColors):
@@ -1134,11 +1161,19 @@ class CaptionStyle(PersistentPropertiesMixin, QObject):
 
     changed = Signal()
 
-    def __init__(self) -> None:
+    def __init__(self, data: dict[str, Any] | None = None) -> None:
         super().__init__()
         self._font_size = 26
         self._colors = CaptionColors()
         self._colors.changed.connect(self.changed.emit)
+        if isinstance(data, dict):
+            self.__setstate__(data)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CaptionStyle:
+        inst = cls()
+        inst.__setstate__(data)
+        return inst
 
     @property
     @property_params(label="Font Size", min=10, max=100)
@@ -1344,18 +1379,32 @@ class CaptioningSettings(PersistentPropertiesMixin, QObject):
 
     def __init__(
         self,
-        prompt: str = DEFAULT_PROMPT,
+        prompt: str | dict[str, Any] = DEFAULT_PROMPT,
         max_tokens: int = 64,
         interval_s: float = 2.0,
         skip_similar: bool = True,
         similarity_threshold: float = 6.0,
     ) -> None:
         super().__init__()
+        if isinstance(prompt, dict):
+            self._prompt = DEFAULT_PROMPT
+            self._max_tokens = max_tokens
+            self._interval_s = interval_s
+            self._skip_similar = skip_similar
+            self._similarity_threshold = similarity_threshold
+            self.__setstate__(prompt)
+            return
         self._prompt = prompt
         self._max_tokens = max_tokens
         self._interval_s = interval_s
         self._skip_similar = skip_similar
         self._similarity_threshold = similarity_threshold
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CaptioningSettings:
+        inst = cls()
+        inst.__setstate__(data)
+        return inst
 
     @property
     @property_params(label="Prompt Template")
@@ -1562,9 +1611,19 @@ class MCPSettings(PersistentPropertiesMixin, QObject):
 
     changed = Signal()
 
-    def __init__(self, port: int = 8765) -> None:
+    def __init__(self, port: int | dict[str, Any] = 8765) -> None:
         super().__init__()
-        self._port = port
+        if isinstance(port, dict):
+            self._port = 8765
+            self.__setstate__(port)
+            return
+        self._port = int(port)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MCPSettings:
+        inst = cls()
+        inst.__setstate__(data)
+        return inst
 
     @property
     @property_params(label="Server Port", min=1024, max=65535)
@@ -1612,7 +1671,9 @@ class VisualContextPlugin(Plugin):
         self._mcp_enabled = True
         self._mcp_uvicorn: Any = None
         self._mcp_server_thread: threading.Thread | None = None
-        self._mcp_dispatch.connect(lambda fn: fn())
+        self._mcp_dispatch.connect(
+            self._on_mcp_dispatch, Qt.ConnectionType.QueuedConnection
+        )
 
         self._narrate_captions = False
         self._last_narrated_ns = -1
@@ -1621,6 +1682,17 @@ class VisualContextPlugin(Plugin):
         except Exception:
             logger.exception("Failed to initialize TTS")
             self._tts = None
+
+    @Slot(object)
+    def _on_mcp_dispatch(self, fn: Any) -> None:
+        fn()
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        ordered = dict(state)
+        for group_key in ("settings", "caption_style", "mcp_settings"):
+            if group_key in ordered:
+                ordered[group_key] = ordered.pop(group_key)
+        super().__setstate__(ordered)
 
     # ------------------------------------------------------------------
     # Cache handling
@@ -2064,7 +2136,9 @@ class VisualContextPlugin(Plugin):
         if not ok or not keyword.strip():
             return
 
-        events_plugin = EventsPlugin.instance()
+        events_plugin: EventsPlugin | None = (
+            Plugin.get_instance_by_name("EventsPlugin") or EventsPlugin.instance()
+        )
         if events_plugin is None:
             self.app.show_notification("Error", "EventsPlugin not loaded.")
             return
@@ -2079,6 +2153,7 @@ class VisualContextPlugin(Plugin):
             return
 
         events_plugin.add_events({f"Saw: {keyword}": timestamps})
+        _refresh_events_plugin_ui(events_plugin)
         self.app.show_notification(
             "Events Created", f"Added {len(timestamps)} events for '{keyword}'."
         )
@@ -2676,20 +2751,65 @@ def _reg_captions(server: Any, plugin: VisualContextPlugin) -> None:
         return plugin._run_on_main(_action)
 
 
+def _refresh_events_plugin_ui(events_plugin: Any) -> None:
+    """Ensure EventsPlugin sidebar widget reflects newly added event types."""
+    try:
+        prop = getattr(type(events_plugin), "event_types", None)
+        if hasattr(prop, "binds"):
+            for widget in prop.binds.get(events_plugin, []):
+                widget.value = events_plugin.event_types
+    except Exception:
+        logger.debug("Could not refresh EventsPlugin widget", exc_info=True)
+
+
+def _resolve_event_timestamp_ns(
+    raw_ts: int | float | str, plugin: VisualContextPlugin
+) -> int:
+    """Convert relative seconds or nanosecond timestamp to exact recording ns."""
+    rec = getattr(plugin, "recording", None)
+    rec_start = int(getattr(rec, "start_time", 0) or 0)
+    val = float(raw_ts) if isinstance(raw_ts, float) else int(str(raw_ts).strip())
+    if isinstance(val, float) or val < 1_000_000_000_000:
+        ts_ns = rec_start + int(float(raw_ts) * 1e9)
+    else:
+        ts_ns = int(val)
+
+    # Snap to exact caption start_ns if within 10 microseconds (handles JSON float64 rounding)
+    if plugin._starts_ns:
+        idx = bisect.bisect_left(plugin._starts_ns, ts_ns)
+        for candidate_idx in (idx - 1, idx):
+            if 0 <= candidate_idx < len(plugin._starts_ns):
+                cand = plugin._starts_ns[candidate_idx]
+                if abs(cand - ts_ns) <= 10_000:
+                    return int(cand)
+    return ts_ns
+
+
 def _reg_events(server: Any, plugin: VisualContextPlugin) -> None:
     @server.tool()
-    def add_events(events: dict[str, list[int]]) -> str:
-        """Add custom timeline events {event_name: [timestamp_ns, ...]}."""
+    def add_events(events: dict[str, list[int | float | str]]) -> str:
+        """Add custom timeline events {event_name: [timestamp_ns_or_relative_s, ...]}."""
         def _action() -> str:
-            events_plugin = EventsPlugin.instance()
+            events_plugin = (
+                Plugin.get_instance_by_name("EventsPlugin") or EventsPlugin.instance()
+            )
             if events_plugin is None:
                 raise RuntimeError("EventsPlugin is not loaded in Neon Player.")
             cleaned = {
-                str(name): [int(ts) for ts in timestamps]
+                str(name): [
+                    _resolve_event_timestamp_ns(ts, plugin) for ts in timestamps
+                ]
                 for name, timestamps in events.items()
             }
             events_plugin.add_events(cleaned)
+            _refresh_events_plugin_ui(events_plugin)
             summary = {k: len(v) for k, v in cleaned.items()}
+            total = sum(summary.values())
+            if getattr(plugin, "app", None) is not None:
+                names = ", ".join(f"'{k}' ({v})" for k, v in summary.items())
+                plugin.app.show_notification(
+                    "Events Created", f"Added {total} events: {names}."
+                )
             return f"Successfully added events: {summary}"
 
         return plugin._run_on_main(_action)
@@ -2698,14 +2818,27 @@ def _reg_events(server: Any, plugin: VisualContextPlugin) -> None:
     def create_events_from_keyword(keyword: str) -> str:
         """Search captions for keyword and add 'Saw: <keyword>' events."""
         def _action() -> str:
-            events_plugin = EventsPlugin.instance()
+            events_plugin = (
+                Plugin.get_instance_by_name("EventsPlugin") or EventsPlugin.instance()
+            )
             if events_plugin is None:
                 raise RuntimeError("EventsPlugin is not loaded in Neon Player.")
-            timestamps = _keyword_event_timestamps(plugin._captions, keyword.strip())
+            kw = keyword.strip()
+            timestamps = _keyword_event_timestamps(plugin._captions, kw)
             if not timestamps:
-                return f"No captions contain '{keyword}'."
-            events_plugin.add_events({f"Saw: {keyword.strip()}": timestamps})
-            return f"Added {len(timestamps)} events for '{keyword}'."
+                if getattr(plugin, "app", None) is not None:
+                    plugin.app.show_notification(
+                        "No Matches", f"No caption contains '{kw}'."
+                    )
+                return f"No captions contain '{kw}'."
+            event_name = f"Saw: {kw}"
+            events_plugin.add_events({event_name: timestamps})
+            _refresh_events_plugin_ui(events_plugin)
+            if getattr(plugin, "app", None) is not None:
+                plugin.app.show_notification(
+                    "Events Created", f"Added {len(timestamps)} events for '{kw}'."
+                )
+            return f"Added {len(timestamps)} events for '{kw}' ({event_name})."
 
         return plugin._run_on_main(_action)
 
