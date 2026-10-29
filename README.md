@@ -127,26 +127,29 @@ In the **MCP Settings** collapsible section of the plugin sidebar:
 | `export_captions_csv(path)` | Export all loaded captions to a CSV file at `path`. |
 | `get_plugin_status()` | Return current plugin status, loaded recording name, caption count, active VLM model, prompt, sampling interval, and MCP endpoint URL. |
 
-## Scripted CLI Generation (`scripts/build_captions.py`)
+## Headless CLI Generation
 
-You can generate and populate the plugin's caption cache headlessly from the
-command line before opening a recording in Neon Player:
+Neon Player supports running plugin jobs headlessly from the command line via `--job`, with a live `tqdm` progress bar and no GUI window:
 
 ```bash
-uv run --python /path/to/neon-player/.venv python scripts/build_captions.py <recording_path> \
-  --model Liquid_2B \
-  --interval 0.33
+# Run using the recording's saved VisualContextPlugin settings
+neon-player "/path/to/recording" --job VisualContextPlugin.bg_generate_captions
+
+# Or pass optional positional overrides: [model] [prompt_template] [interval_s]
+neon-player "/path/to/recording" \
+  --job VisualContextPlugin.bg_generate_captions Liquid_2B Event_Gaze_Aware 0.33
+
+# Or supply a custom recording settings JSON file
+neon-player "/path/to/recording" \
+  --recording-settings "/path/to/settings.json" \
+  --job VisualContextPlugin.bg_generate_captions
 ```
 
-### CLI Options
+### Headless Job Arguments (`VisualContextPlugin.bg_generate_captions`)
 
-- `--model {Liquid_2B,Fast_2B,Balanced_4B,Quality_8B}` — VLM model preset (default: `Fast_2B`).
-- `--template` — Prompt template (`Default`, `Gaze & Action`, `Event & Gaze Aware (Temporal)`, `Gazed Object (One Word)`, `Detailed Scene`, `Delta Changes`, `Custom`).
-- `--interval FLOAT` — Seconds between sampled frames (default: `2.0`; use `0.33` for ~3 Hz dense captioning).
-- `--duration FLOAT` — Limit captioning to the first `N` seconds of the recording.
-- `--max-tokens INT` — Max tokens per caption (default: `200`).
-- `--no-skip-similar` — Disable redundancy skipping and caption every sampled frame.
-- `--print-all` — Print all generated captions with timestamps to stdout upon completion.
+1. `model` *(optional)* — Model preset name (`Liquid_2B`, `Fast_2B`, `Balanced_4B`, `Quality_8B`) or repository ID.
+2. `prompt_template` *(optional)* — Template enum name or label (`Default`, `Gaze_Action`, `Event_Gaze_Aware`, `Gazed_Object`, `Detailed_Scene`, `Delta_Changes`, `Custom`).
+3. `interval_s` *(optional)* — Seconds between sampled frames (e.g. `0.33` for ~3 Hz dense captioning, `2.0` default).
 
 ## Settings
 

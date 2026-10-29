@@ -1418,7 +1418,10 @@ class CaptioningSettings(PersistentPropertiesMixin, QObject):
     @prompt_template.setter
     def prompt_template(self, v: PromptTemplate | str) -> None:
         if isinstance(v, str):
-            v = PromptTemplate(v)
+            try:
+                v = PromptTemplate(v)
+            except ValueError:
+                v = PromptTemplate[v]
         if v != PromptTemplate.Custom:
             self.prompt = PROMPT_TEMPLATES[v.value]
         self.changed.emit()
@@ -1811,7 +1814,7 @@ class VisualContextPlugin(Plugin):
         self._captions = []
         self._starts_ns = []
 
-        if self._mcp_enabled:
+        if self._mcp_enabled and not self.headless:
             self._start_mcp_server()
 
         # Pass `recording` explicitly so this never depends on when the app
@@ -2054,7 +2057,7 @@ class VisualContextPlugin(Plugin):
         if self._mcp_enabled == enabled:
             return
         self._mcp_enabled = enabled
-        if self._mcp_enabled:
+        if self._mcp_enabled and not self.headless:
             self._start_mcp_server()
         else:
             self._stop_mcp_server()
@@ -2404,7 +2407,19 @@ class VisualContextPlugin(Plugin):
             cache_filename,
         )
 
-    def bg_generate_captions(self) -> Generator[ProgressUpdate, None, None]:
+    def bg_generate_captions(
+        self,
+        model: str = "",
+        prompt_template: str = "",
+        interval_s: float = 0.0,
+    ) -> Generator[ProgressUpdate, None, None]:
+        if model:
+            self.model = model
+        if prompt_template:
+            self.prompt_template = prompt_template
+        if interval_s > 0.0:
+            self.interval_s = interval_s
+
         # NB: `ProgressUpdate`'s second field is `datum`, which nothing in the
         # app reads, so only the fraction is reported.
         yield ProgressUpdate(0.0)
