@@ -2734,9 +2734,10 @@ def _reg_lifecycle(server: Any, plugin: VisualContextPlugin) -> None:
             getattr(rec, "name", None)
             or (rec._rec_dir.name if rec and hasattr(rec, "_rec_dir") else None)
         )
+        job = getattr(plugin, "_job", None)
         is_running = (
-            plugin.job is not None
-            and getattr(plugin.job, "is_running", lambda: False)()
+            job is not None
+            and getattr(job, "is_running", lambda: False)()
         )
         port = plugin._mcp_settings.port
         return {
