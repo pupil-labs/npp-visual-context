@@ -8,8 +8,9 @@
 #     "pillow",
 #     "mcp",
 #     "uvicorn",
+#     "anyio>=4.9,<4.15",
+#     "pydantic>=2.11,<2.14",
 #     "mlx-vlm; sys_platform == 'darwin' and platform_machine == 'arm64'",
-#     "typing-extensions>=4.16.0",
 # ]
 #
 # [tool.uv.sources]
@@ -53,6 +54,7 @@ import threading
 import time
 from collections.abc import Generator
 from concurrent.futures import Future
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +110,21 @@ from qt_property_widgets.widgets import (
     PropertyWidget,
 )
 
+if isinstance(property_params, type):
+    _PARAMS_FROZEN = bool(
+        getattr(
+            getattr(property_params, "__dataclass_params__", None),
+            "frozen",
+            False,
+        )
+    )
+
+    @dataclass(frozen=_PARAMS_FROZEN)
+    class collapsible_property_params(property_params):
+        enable_prop: str | None = None
+else:
+    collapsible_property_params = property_params  # type: ignore[misc,assignment]
+
 logger = logging.getLogger(__name__)
 
 CACHE_VERSION = 3
@@ -132,25 +149,39 @@ CAPTION_BAND_HEIGHT = 0.28
 CAPTION_BAND_WIDTH = 0.85
 
 DEFAULT_PROMPT = (
-    "In a telegraphic, action-first phrase (under 15 words), describe what is visible and being done in this first-person scene. "
-    "Start directly with an active verb or main objects (e.g. 'Pushing bicycle past brick stairs', 'Sitting at desk typing'). "
-    "Do not use filler phrases or third-person perspective words like 'A person' or 'The image shows'."
+    "In a telegraphic, action-first phrase (under 15 words), describe what is "
+    "visible and being done in this first-person scene. Start directly with an "
+    "active verb or main objects (e.g. 'Pushing bicycle past brick stairs', "
+    "'Sitting at desk typing'). Do not use filler phrases or third-person "
+    "perspective words like 'A person' or 'The image shows'."
 )
 
-EVENT_GAZE_SYSTEM_PROMPT = """\
-You are an event-oriented, gaze-aware visual scene understanding system analyzing sequential frames from a scene camera worn by a person.
-The wearer's gaze position is provided as pixel coordinates (x, y).
-
-Your task is to produce a concise, telegraphic factual update of what is happening right now in the scene.
-
-Rules:
-1. Focus strictly on observable actions, visible objects, and what the wearer is looking at or interacting with.
-2. Limit the scene update to 1 short, telegraphic action-first phrase (under 15 words, e.g. "Holding phone with map next to parked bicycle", "Reaching for door handle to outdoor stairs").
-3. NEVER use filler phrases (do NOT say "The wearer is", "The camera wearer", "A person is", "The environment is", "In this image", "The camera shows", "The person's gaze is on"). Start directly with the action or objects.
-4. Only describe objects that are currently visible. When the scene or environment changes, describe the new scene and do not repeat previous objects.
-5. If the scene, objects, and wearer action are unchanged, return NO_CHANGE.
-6. Output valid JSON in the format:
-{"scene_update": "<telegraphic action phrase>", "gaze_target": "<object or surface at gaze point>", "events": ["<notable action if any>"]}"""
+EVENT_GAZE_SYSTEM_PROMPT = (
+    "You are an event-oriented, gaze-aware visual scene understanding system "
+    "analyzing sequential frames from a scene camera worn by a person.\n"
+    "The wearer's gaze position is provided as pixel coordinates (x, y).\n\n"
+    "Your task is to produce a concise, telegraphic factual update of what is "
+    "happening right now in the scene.\n\n"
+    "Rules:\n"
+    "1. Focus strictly on observable actions, visible objects, and what the "
+    "wearer is looking at or interacting with.\n"
+    "2. Limit the scene update to 1 short, telegraphic action-first phrase "
+    '(under 15 words, e.g. "Holding phone with map next to parked bicycle", '
+    '"Reaching for door handle to outdoor stairs").\n'
+    '3. NEVER use filler phrases (do NOT say "The wearer is", '
+    '"The camera wearer", "A person is", "The environment is", '
+    '"In this image", "The camera shows", "The person\'s gaze is on"). '
+    "Start directly with the action or objects.\n"
+    "4. Only describe objects that are currently visible. When the scene or "
+    "environment changes, describe the new scene and do not repeat previous "
+    "objects.\n"
+    "5. If the scene, objects, and wearer action are unchanged, return "
+    "NO_CHANGE.\n"
+    "6. Output valid JSON in the format:\n"
+    '{"scene_update": "<telegraphic action phrase>", '
+    '"gaze_target": "<object or surface at gaze point>", '
+    '"events": ["<notable action if any>"]}'
+)
 
 EVENT_GAZE_PROMPT_TEMPLATE = (
     "Event-oriented, gaze-aware scene understanding with temporal memory. "
@@ -169,10 +200,13 @@ PROMPT_TEMPLATES = {
     "Detailed Scene": DETAILED_SCENE_PROMPT,
     "Default": DEFAULT_PROMPT,
     "Gaze & Action": (
-        "In a telegraphic, action-first phrase (under 15 words), describe what is being done or looked at in this first-person scene. "
-        "The gaze point is at ({gaze_x}, {gaze_y}) in this {width}x{height} image. "
-        "Start directly with an active verb or object (e.g. 'Holding phone with map', 'Pushing bicycle up stairs', 'Reaching for door handle'). "
-        "NEVER use filler phrases like 'The wearer', 'The camera wearer', 'A person', 'A first-person view', 'This image shows', or 'The environment is'."
+        "In a telegraphic, action-first phrase (under 15 words), describe what "
+        "is being done or looked at in this first-person scene. The gaze point "
+        "is at ({gaze_x}, {gaze_y}) in this {width}x{height} image. Start "
+        "directly with an active verb or object (e.g. 'Holding phone with map', "
+        "'Pushing bicycle up stairs', 'Reaching for door handle'). NEVER use "
+        "filler phrases like 'The wearer', 'The camera wearer', 'A person', "
+        "'A first-person view', 'This image shows', or 'The environment is'."
     ),
     "Event & Gaze Aware (Temporal)": EVENT_GAZE_PROMPT_TEMPLATE,
     "Gazed Object (One Word)": (
@@ -259,7 +293,7 @@ def _cache_filename_for(
     key = _settings_cache_key(
         model, prompt, interval_s, skip_similar, similarity_threshold
     )
-    model_tag = re.sub(r"[^a-zA-Z0-9_.-]", "_", model.split("/")[-1])
+    model_tag = re.sub(r"[^a-zA-Z0-9_.-]", "_", model.rsplit("/", maxsplit=1)[-1])
     return f"visual_context_{model_tag}_{key}.json"
 
 
@@ -413,7 +447,8 @@ _BOILERPLATE_CLAUSES = (
 
 _FILLER_REGEX = re.compile(
     r"^(in |from )?a first-person (view|perspective)( shows| of| from|,)?\s*"
-    r"|^(the )?(camera )?wearer('s| is| looks| holds| stands| sees)?( now)?( seen| looking at| holding)?\s*"
+    r"|^(the )?(camera )?wearer('s| is| looks| holds| stands| sees)?"
+    r"( now)?( seen| looking at| holding)?\s*"
     r"|^a person('s| is| holds| stands)?( seen)?( looking at| holding)?\s*"
     r"|^(this |the )?(image|photo|scene|environment)( shows| depicts| is)?( a| an)?\s*",
     re.IGNORECASE,
@@ -432,7 +467,7 @@ def _clean_caption(text: Any) -> str:
         return ""
 
     cleaned = " ".join(text.split())
-    # Strip leading subject/perspective filler (e.g. "The camera wearer is looking at...")
+    # Strip leading subject/perspective filler (e.g. "The camera wearer is...")
     cleaned = _FILLER_REGEX.sub("", cleaned).strip()
     lowered = cleaned.lower()
 
@@ -878,7 +913,7 @@ class _Captioner:
             elif hasattr(mx, "metal") and hasattr(mx.metal, "set_cache_limit"):
                 mx.metal.set_cache_limit(128 * 1024 * 1024)
         except Exception:
-            pass
+            logger.debug("Could not set MLX cache limit", exc_info=True)
 
         from mlx_vlm import load
         from mlx_vlm.utils import load_config
@@ -951,7 +986,7 @@ class _Captioner:
 
                 mx.clear_cache()
             except Exception:
-                pass
+                logger.debug("Could not clear MLX cache", exc_info=True)
 
         # mlx-vlm returns a GenerationResult; older versions returned a str.
         raw = getattr(result, "text", result)
@@ -1045,7 +1080,9 @@ class CaptionColors(PersistentPropertiesMixin, QObject):
             text_color = data.get("text_color", "#FFFFFF")
             highlight_color = data.get("highlight_color", "#FFD600")
         self._text_color = (
-            QColor(*text_color) if isinstance(text_color, (list, tuple)) else QColor(text_color)
+            QColor(*text_color)
+            if isinstance(text_color, (list, tuple))
+            else QColor(text_color)
         )
         self._highlight_color = (
             QColor(*highlight_color)
@@ -1692,6 +1729,18 @@ class VisualContextPlugin(Plugin):
     def _on_mcp_dispatch(self, fn: Any) -> None:
         fn()
 
+    def _safe_recording(self) -> Any:
+        try:
+            return self.recording
+        except RuntimeError:
+            return None
+
+    def _safe_headless(self) -> bool:
+        try:
+            return self.headless
+        except RuntimeError:
+            return True
+
     def __setstate__(self, state: dict[str, Any]) -> None:
         ordered = dict(state)
         for group_key in ("settings", "caption_style", "mcp_settings"):
@@ -1723,17 +1772,17 @@ class VisualContextPlugin(Plugin):
             self.similarity_threshold,
         )
 
-    def _read_cache(self, recording: Any = None) -> dict[str, Any] | None:
+    def _read_cache(self, _recording: Any = None) -> dict[str, Any] | None:
         target_filename = self._current_cache_filename()
         try:
-            data = self.load_cached_json(target_filename, recording=recording)
+            data = self.load_cached_json(target_filename)
             if isinstance(data, dict):
                 return data
         except (json.JSONDecodeError, OSError):
             logger.exception("Failed to read visual context cache %s", target_filename)
 
         try:
-            legacy = self.load_cached_json(CACHE_FILENAME, recording=recording)
+            legacy = self.load_cached_json(CACHE_FILENAME)
         except (json.JSONDecodeError, OSError):
             logger.exception("Failed to read visual context cache")
             return None
@@ -1766,7 +1815,7 @@ class VisualContextPlugin(Plugin):
         return None
 
     def _on_settings_or_model_changed(self) -> None:
-        rec = getattr(self, "recording", None)
+        rec = self._safe_recording()
         if rec is not None:
             self.on_recording_loaded(rec)
         self.changed.emit()
@@ -1852,7 +1901,7 @@ class VisualContextPlugin(Plugin):
     # ------------------------------------------------------------------
 
     @property
-    @property_params(
+    @collapsible_property_params(
         primary=True,
         widget=CollapsibleGroupWidget,
         label="Display Captions",
@@ -2030,7 +2079,7 @@ class VisualContextPlugin(Plugin):
         return keywords
 
     @property
-    @property_params(
+    @collapsible_property_params(
         primary=True,
         widget=CollapsibleGroupWidget,
         label="Model Context Protocol (MCP)",
@@ -2059,7 +2108,7 @@ class VisualContextPlugin(Plugin):
         if self._mcp_enabled == enabled:
             return
         self._mcp_enabled = enabled
-        if self._mcp_enabled and not self.headless:
+        if self._mcp_enabled and not self._safe_headless():
             self._start_mcp_server()
         else:
             self._stop_mcp_server()
@@ -2094,7 +2143,10 @@ class VisualContextPlugin(Plugin):
         # The previous captions are deliberately left in place: if this run
         # fails, a successful earlier run is not thrown away.
         if self.headless:
-            self.job_manager.run_in_foreground(self.bg_generate_captions())
+            if hasattr(self.job_manager, "work_job"):
+                self.job_manager.work_job(self.bg_generate_captions())
+            else:
+                self.job_manager.run_in_foreground(self.bg_generate_captions())
             self._on_captions_ready()
             return
 
@@ -2103,7 +2155,6 @@ class VisualContextPlugin(Plugin):
         self.job = self.job_manager.run_background_action(
             "Captioning Scene Video",
             "VisualContextPlugin.bg_generate_captions",
-            notify_on_completion=False,
         )
         if self.job is None:
             return
@@ -2409,12 +2460,9 @@ class VisualContextPlugin(Plugin):
             cache_filename,
         )
 
-    def bg_generate_captions(
-        self,
-        model: str = "",
-        prompt_template: str = "",
-        interval_s: float = 0.0,
-    ) -> Generator[ProgressUpdate, None, None]:
+    def _apply_job_overrides(
+        self, model: str, prompt_template: str, interval_s: float
+    ) -> None:
         if model:
             self.model = model
         if prompt_template:
@@ -2422,22 +2470,31 @@ class VisualContextPlugin(Plugin):
         if interval_s > 0.0:
             self.interval_s = interval_s
 
-        # NB: `ProgressUpdate`'s second field is `datum`, which nothing in the
-        # app reads, so only the fraction is reported.
-        yield ProgressUpdate(0.0)
-
-        scene, times_ns, indices = self._validate_scene_frames()
-
-        is_event_gaze_aware = (
+    def _is_event_gaze_aware_prompt(self) -> bool:
+        return (
             self.prompt_template == PromptTemplate.Event_Gaze_Aware
             or "temporal memory" in self.prompt.lower()
             or "event-oriented" in self.prompt.lower()
             or "EVENT_GAZE_SYSTEM_PROMPT" in self.prompt
         )
 
-        max_tokens = self.max_tokens
-        if is_event_gaze_aware and max_tokens < 350:
-            max_tokens = 350
+    def bg_generate_captions(
+        self,
+        model: str = "",
+        prompt_template: str = "",
+        interval_s: float = 0.0,
+    ) -> Generator[ProgressUpdate, None, None]:
+        self._apply_job_overrides(model, prompt_template, interval_s)
+
+        # NB: `ProgressUpdate`'s second field is `datum`, which nothing in the
+        # app reads, so only the fraction is reported.
+        yield ProgressUpdate(0.0)
+
+        scene, times_ns, indices = self._validate_scene_frames()
+        is_event_gaze_aware = self._is_event_gaze_aware_prompt()
+        max_tokens = (
+            max(self.max_tokens, 350) if is_event_gaze_aware else self.max_tokens
+        )
 
         captioner = _Captioner(self._model, max_tokens)
         total = len(indices)
@@ -2677,6 +2734,16 @@ class VisualContextPlugin(Plugin):
 
 def _create_mcp_server(plugin: VisualContextPlugin) -> Any:
     try:
+        import typing_extensions
+
+        if not hasattr(typing_extensions, "sentinel") and hasattr(
+            typing_extensions, "Sentinel"
+        ):
+            typing_extensions.sentinel = typing_extensions.Sentinel  # type: ignore[attr-defined]
+    except ImportError:
+        logger.debug("typing_extensions not available", exc_info=True)
+
+    try:
         try:
             from mcp.server.mcpserver import MCPServer
         except ImportError:
@@ -2780,7 +2847,7 @@ def _refresh_events_plugin_ui(events_plugin: Any) -> None:
 
 
 def _resolve_event_timestamp_ns(
-    raw_ts: int | float | str, plugin: VisualContextPlugin
+    raw_ts: float | str, plugin: VisualContextPlugin
 ) -> int:
     """Convert relative seconds or nanosecond timestamp to exact recording ns."""
     rec = getattr(plugin, "recording", None)
@@ -2791,7 +2858,7 @@ def _resolve_event_timestamp_ns(
     else:
         ts_ns = int(val)
 
-    # Snap to exact caption start_ns if within 10 microseconds (handles JSON float64 rounding)
+    # Snap to exact caption start_ns if within 10 us (handles JSON float64 rounding)
     if plugin._starts_ns:
         idx = bisect.bisect_left(plugin._starts_ns, ts_ns)
         for candidate_idx in (idx - 1, idx):
@@ -2802,16 +2869,26 @@ def _resolve_event_timestamp_ns(
     return ts_ns
 
 
+def _require_events_plugin() -> EventsPlugin:
+    events_plugin = (
+        Plugin.get_instance_by_name("EventsPlugin") or EventsPlugin.instance()
+    )
+    if events_plugin is None:
+        raise RuntimeError("EventsPlugin is not loaded in Neon Player.")
+    return events_plugin  # type: ignore[return-value]
+
+
+def _notify_app(plugin: VisualContextPlugin, title: str, message: str) -> None:
+    if getattr(plugin, "app", None) is not None:
+        plugin.app.show_notification(title, message)
+
+
 def _reg_events(server: Any, plugin: VisualContextPlugin) -> None:
     @server.tool()
     def add_events(events: dict[str, list[int | float | str]]) -> str:
-        """Add custom timeline events {event_name: [timestamp_ns_or_relative_s, ...]}."""
+        """Add custom timeline events {event_name: [timestamp_ns_or_s, ...]}."""
         def _action() -> str:
-            events_plugin = (
-                Plugin.get_instance_by_name("EventsPlugin") or EventsPlugin.instance()
-            )
-            if events_plugin is None:
-                raise RuntimeError("EventsPlugin is not loaded in Neon Player.")
+            events_plugin = _require_events_plugin()
             cleaned = {
                 str(name): [
                     _resolve_event_timestamp_ns(ts, plugin) for ts in timestamps
@@ -2822,11 +2899,10 @@ def _reg_events(server: Any, plugin: VisualContextPlugin) -> None:
             _refresh_events_plugin_ui(events_plugin)
             summary = {k: len(v) for k, v in cleaned.items()}
             total = sum(summary.values())
-            if getattr(plugin, "app", None) is not None:
-                names = ", ".join(f"'{k}' ({v})" for k, v in summary.items())
-                plugin.app.show_notification(
-                    "Events Created", f"Added {total} events: {names}."
-                )
+            names = ", ".join(f"'{k}' ({v})" for k, v in summary.items())
+            _notify_app(
+                plugin, "Events Created", f"Added {total} events: {names}."
+            )
             return f"Successfully added events: {summary}"
 
         return plugin._run_on_main(_action)
@@ -2835,26 +2911,22 @@ def _reg_events(server: Any, plugin: VisualContextPlugin) -> None:
     def create_events_from_keyword(keyword: str) -> str:
         """Search captions for keyword and add 'Saw: <keyword>' events."""
         def _action() -> str:
-            events_plugin = (
-                Plugin.get_instance_by_name("EventsPlugin") or EventsPlugin.instance()
-            )
-            if events_plugin is None:
-                raise RuntimeError("EventsPlugin is not loaded in Neon Player.")
+            events_plugin = _require_events_plugin()
             kw = keyword.strip()
             timestamps = _keyword_event_timestamps(plugin._captions, kw)
             if not timestamps:
-                if getattr(plugin, "app", None) is not None:
-                    plugin.app.show_notification(
-                        "No Matches", f"No caption contains '{kw}'."
-                    )
+                _notify_app(
+                    plugin, "No Matches", f"No caption contains '{kw}'."
+                )
                 return f"No captions contain '{kw}'."
             event_name = f"Saw: {kw}"
             events_plugin.add_events({event_name: timestamps})
             _refresh_events_plugin_ui(events_plugin)
-            if getattr(plugin, "app", None) is not None:
-                plugin.app.show_notification(
-                    "Events Created", f"Added {len(timestamps)} events for '{kw}'."
-                )
+            _notify_app(
+                plugin,
+                "Events Created",
+                f"Added {len(timestamps)} events for '{kw}'.",
+            )
             return f"Added {len(timestamps)} events for '{kw}' ({event_name})."
 
         return plugin._run_on_main(_action)
