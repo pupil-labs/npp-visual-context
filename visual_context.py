@@ -2798,7 +2798,10 @@ def _build_uvicorn_server(server: Any, host: str, port: int) -> Any:
     import uvicorn
 
     if hasattr(server, "streamable_http_app"):
-        app = server.streamable_http_app(streamable_http_path="/mcp")
+        try:
+            app = server.streamable_http_app(streamable_http_path="/mcp")
+        except TypeError:
+            app = server.streamable_http_app()
     elif hasattr(server, "sse_app"):
         app = server.sse_app()
     else:
