@@ -10,7 +10,7 @@
 #     "uvicorn",
 #     "anyio>=4.9,<4.15",
 #     "pydantic>=2.11,<2.14",
-#     "mlx-vlm; sys_platform == 'darwin' and platform_machine == 'arm64'",
+#     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm.git ; sys_platform == 'darwin' and platform_machine == 'arm64'",  # ruff: ignore[line-too-long]
 # ]
 #
 # [tool.uv.sources]
@@ -65,6 +65,7 @@ from pupil_labs.neon_player.plugins.events import EventsPlugin
 from PySide6.QtCore import (
     QObject,
     QPointF,
+    QProcess,
     QRect,
     QRectF,
     Qt,
@@ -84,7 +85,6 @@ from PySide6.QtGui import (
     QTextDocument,
     QTextOption,
 )
-from PySide6.QtTextToSpeech import QTextToSpeech
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -1687,6 +1687,42 @@ class MCPSettings(PersistentPropertiesMixin, QObject):
         pass
 
 
+class _MacSayTTS:
+    """Fallback TTS using macOS `/usr/bin/say` when `QtTextToSpeech` is absent."""
+
+    def __init__(self) -> None:
+        self._proc: QProcess | None = None
+
+    def say(self, text: str) -> None:
+        self.stop()
+        if not text:
+            return
+        proc = QProcess()
+        proc.start("/usr/bin/say", [text])
+        self._proc = proc
+
+    def stop(self) -> None:
+        if (
+            self._proc is not None
+            and self._proc.state() != QProcess.ProcessState.NotRunning
+        ):
+            self._proc.terminate()
+            self._proc.waitForFinished(200)
+        self._proc = None
+
+
+def _init_tts() -> Any:
+    try:
+        from PySide6.QtTextToSpeech import QTextToSpeech
+
+        return QTextToSpeech()
+    except Exception:
+        if sys.platform == "darwin" and Path("/usr/bin/say").exists():
+            return _MacSayTTS()
+        logger.debug("QTextToSpeech not available in this build", exc_info=True)
+        return None
+
+
 class VisualContextPlugin(Plugin):
     label = "Visual Context (Scene Captioning)"
     _mcp_dispatch = Signal(object)
@@ -1719,11 +1755,7 @@ class VisualContextPlugin(Plugin):
 
         self._narrate_captions = False
         self._last_narrated_ns = -1
-        try:
-            self._tts = QTextToSpeech()
-        except Exception:
-            logger.exception("Failed to initialize TTS")
-            self._tts = None
+        self._tts: Any = _init_tts()
 
     @Slot(object)
     def _on_mcp_dispatch(self, fn: Any) -> None:
