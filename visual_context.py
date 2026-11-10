@@ -56,10 +56,10 @@ from collections.abc import Generator
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
-from PIL import Image
+from PIL import Image  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
 from pupil_labs.neon_player import Plugin, ProgressUpdate, action
 from pupil_labs.neon_player.plugins.events import EventsPlugin
 from PySide6.QtCore import (
@@ -734,7 +734,7 @@ class CaptionRenderer:
 def _clear_mlx_cache() -> None:
     if "mlx" in sys.modules or "mlx.core" in sys.modules:
         try:
-            import mlx.core as mx
+            import mlx.core as mx  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
 
             mx.clear_cache()
         except Exception:
@@ -744,7 +744,12 @@ def _clear_mlx_cache() -> None:
 class _Captioner:
     """Loads a VLM once and captions many images, then releases it."""
 
-    def __init__(self, model: CaptionModel, max_tokens: int) -> None:
+    def __init__(self, model: CaptionModel | str, max_tokens: int) -> None:
+        if isinstance(model, str):
+            try:
+                model = CaptionModel(model)
+            except ValueError:
+                model = CaptionModel[model]
         self._preset = model
         self._max_tokens = max_tokens
         self._model: Any = None
@@ -776,7 +781,7 @@ class _Captioner:
 
     def _load_mlx(self) -> None:
         try:
-            import mlx.core as mx
+            import mlx.core as mx  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
 
             if hasattr(mx, "set_cache_limit"):
                 mx.set_cache_limit(128 * 1024 * 1024)
@@ -785,8 +790,8 @@ class _Captioner:
         except Exception:
             logger.debug("Could not set MLX cache limit", exc_info=True)
 
-        from mlx_vlm import load
-        from mlx_vlm.utils import load_config
+        from mlx_vlm import load  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
+        from mlx_vlm.utils import load_config  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
 
         model, processor = load(self.repo)
         self._config = load_config(self.repo)
@@ -795,8 +800,8 @@ class _Captioner:
         self._model, self._processor = model, processor
 
     def _load_transformers(self) -> None:
-        import torch
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+        import torch  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
+        from transformers import AutoModelForImageTextToText, AutoProcessor  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
 
         model = AutoModelForImageTextToText.from_pretrained(
             self.repo, dtype="auto", device_map="auto"
@@ -818,8 +823,8 @@ class _Captioner:
     def _caption_mlx(
         self, image: Image.Image, prompt: str, system_prompt: str | None = None
     ) -> str:
-        from mlx_vlm import generate
-        from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm import generate  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
+        from mlx_vlm.prompt_utils import apply_chat_template  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
 
         assert self._tmp_image is not None
         image.save(self._tmp_image, format="JPEG", quality=92)
@@ -904,7 +909,7 @@ class _Captioner:
         gc.collect()
 
         if "torch" in sys.modules:
-            import torch
+            import torch  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1365,9 +1370,9 @@ class _SettingsGroup(PersistentPropertiesMixin, QObject):
     changed = Signal()
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Any:
+    def from_dict(cls, state: dict[str, Any]) -> Any:
         inst = cls()
-        inst.__setstate__(data)
+        inst.__setstate__(state)
         return inst
 
 
@@ -1512,7 +1517,7 @@ class CaptionStyle(_SettingsGroup):
         self.changed.emit()
 
     @property
-    @property_params(label="Color", widget=CaptionColorsWidget)
+    @property_params(label="Color", widget=cast(Any, CaptionColorsWidget))
     def colors(self) -> CaptionColors:
         return self._colors
 
@@ -1568,7 +1573,8 @@ class CollapsibleGroupWidget(PropertyWidget):
         self.expander = Expander(
             title=title, content_widget=self.form, expanded=expanded
         )
-        self.expander.layout().setContentsMargins(0, 0, 0, 0)
+        if (exp_layout := self.expander.layout()) is not None:
+            exp_layout.setContentsMargins(0, 0, 0, 0)
         self.setObjectName("CollapsibleGroupWidget")
         self.setStyleSheet("""
             CollapsibleGroupWidget Expander {
@@ -1724,7 +1730,9 @@ class CaptioningSettings(_SettingsGroup):
         self.changed.emit()
 
     @property
-    @property_params(label="Edit Prompt", widget=EditPromptWidget, dont_encode=True)
+    @property_params(
+        label="Edit Prompt", widget=cast(Any, EditPromptWidget), dont_encode=True
+    )
     def edit_prompt(self) -> None:
         return None
 
@@ -1909,7 +1917,9 @@ class MCPSettings(_SettingsGroup):
         self.changed.emit()
 
     @property
-    @property_params(label="Endpoint", widget=MCPInfoWidget, dont_encode=True)
+    @property_params(
+        label="Endpoint", widget=cast(Any, MCPInfoWidget), dont_encode=True
+    )
     def endpoint(self) -> None:
         return None
 
@@ -1952,7 +1962,7 @@ class TTSController:
     @staticmethod
     def init_backend() -> Any:
         try:
-            from PySide6.QtTextToSpeech import QTextToSpeech
+            from PySide6.QtTextToSpeech import QTextToSpeech  # type: ignore[import-not-found]
 
             return QTextToSpeech()
         except Exception:
@@ -2048,9 +2058,9 @@ class VisualContextMCPBridge:
 
         try:
             try:
-                from mcp.server.mcpserver import MCPServer
+                from mcp.server.mcpserver import MCPServer  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
             except ImportError:
-                from mcp.server.fastmcp import FastMCP as MCPServer
+                from mcp.server.fastmcp import FastMCP as MCPServer  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
         except ImportError as exc:
             logger.warning("MCP server dependencies not available: %s", exc)
             cls.notify_app(
@@ -2066,7 +2076,7 @@ class VisualContextMCPBridge:
 
     @staticmethod
     def build_uvicorn_server(server: Any, host: str, port: int) -> Any:
-        import uvicorn
+        import uvicorn  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
 
         if hasattr(server, "streamable_http_app"):
             try:
@@ -2178,7 +2188,7 @@ class VisualContextMCPBridge:
                     plugin.prompt = prompt
                 if interval_s is not None:
                     plugin.interval_s = interval_s
-                plugin.generate_captions()
+                plugin.generate_captions()  # ty: ignore[call-non-callable]
                 return "Started caption generation background job."
 
             return plugin._run_on_main(_action)
@@ -2261,9 +2271,8 @@ class VisualContextMCPBridge:
 
     @staticmethod
     def get_events_plugin() -> EventsPlugin | None:
-        return (
-            Plugin.get_instance_by_name("EventsPlugin") or EventsPlugin.instance()  # type: ignore[return-value]
-        )
+        inst = Plugin.get_instance_by_name("EventsPlugin") or EventsPlugin.instance()
+        return inst if isinstance(inst, EventsPlugin) else None
 
     @classmethod
     def require_events_plugin(cls) -> EventsPlugin:
@@ -2419,7 +2428,7 @@ class VisualContextPlugin(Plugin):
     @property
     @collapsible_property_params(
         primary=True,
-        widget=CollapsibleGroupWidget,
+        widget=cast(Any, CollapsibleGroupWidget),
         label="Display Captions",
         enable_prop="show_captions",
     )
@@ -2463,7 +2472,7 @@ class VisualContextPlugin(Plugin):
         return self._model
 
     @model.setter
-    def model(self, v: CaptionModel) -> None:
+    def model(self, v: CaptionModel | str) -> None:
         if isinstance(v, str):
             try:
                 v = CaptionModel(v)
@@ -2477,7 +2486,7 @@ class VisualContextPlugin(Plugin):
     @property
     @property_params(
         primary=True,
-        widget=CollapsibleGroupWidget,
+        widget=cast(Any, CollapsibleGroupWidget),
         label="Settings",
     )
     def settings(self) -> CaptioningSettings:
@@ -2518,7 +2527,7 @@ class VisualContextPlugin(Plugin):
     @property
     @collapsible_property_params(
         primary=True,
-        widget=CollapsibleGroupWidget,
+        widget=cast(Any, CollapsibleGroupWidget),
         label="Model Context Protocol (MCP)",
         enable_prop="mcp_enabled",
     )
@@ -2780,13 +2789,13 @@ class VisualContextPlugin(Plugin):
             self._record_failure(message)
             raise RuntimeError(message)
 
-        VlmCaptioningPipeline.assign_end_times(
-            captions, times_ns, self.recording.start_time
-        )
+        rec = self._safe_recording()
+        start_time = getattr(rec, "start_time", 0) if rec is not None else 0
+        VlmCaptioningPipeline.assign_end_times(captions, times_ns, start_time)
         total_time_s = time.time() - t_start
         cache_filename = CaptionStorage.save_cache(
             save_fn=self.save_cached_json,
-            start_time=self.recording.start_time,
+            start_time=start_time,
             model=captioner.repo,
             backend=captioner.backend,
             prompt=self.prompt,
