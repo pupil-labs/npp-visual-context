@@ -1355,7 +1355,7 @@ def _proxy_property(target_attr: str, name: str) -> property:
     """Create a hidden backward-compatibility property forwarding to a subgroup."""
 
     @property_params(widget=None, dont_encode=True)
-    def _get(self: Any) -> Any:
+    def _get(self: Any) -> object:
         return getattr(getattr(self, target_attr), name)
 
     def _set(self: Any, value: Any) -> None:
@@ -2336,26 +2336,6 @@ class VisualContextPlugin(Plugin):
         self._narrate_captions = False
         self._tts = TTSController()
 
-    @property
-    def _mcp_uvicorn(self) -> Any:
-        return self._mcp_bridge._uvicorn_server
-
-    @property
-    def _mcp_server_thread(self) -> threading.Thread | None:
-        return self._mcp_bridge._thread
-
-    @property
-    def _mcp_running_port(self) -> int | None:
-        return self._mcp_bridge.running_port
-
-    @property
-    def _last_narrated_ns(self) -> int:
-        return self._tts._last_narrated_ns
-
-    @_last_narrated_ns.setter
-    def _last_narrated_ns(self, value: int) -> None:
-        self._tts._last_narrated_ns = value
-
     @Slot(object)
     def _on_mcp_dispatch(self, fn: Any) -> None:
         fn()
@@ -2374,6 +2354,13 @@ class VisualContextPlugin(Plugin):
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         ordered = dict(state)
+        for junk in (
+            "_mcp_uvicorn",
+            "_mcp_server_thread",
+            "_mcp_running_port",
+            "_last_narrated_ns",
+        ):
+            ordered.pop(junk, None)
         for group_key in ("settings", "caption_style", "mcp_settings"):
             if group_key in ordered:
                 ordered[group_key] = ordered.pop(group_key)
