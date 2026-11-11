@@ -2011,7 +2011,11 @@ class VisualContextMCPBridge:
             return
 
         host = "127.0.0.1"
-        uvicorn_server = self.build_uvicorn_server(server, host, port)
+        try:
+            uvicorn_server = self.build_uvicorn_server(server, host, port)
+        except Exception as exc:  # ruff: ignore[blind-except]
+            logger.warning("Failed to initialize MCP uvicorn server: %s", exc)
+            return
         self._uvicorn_server = uvicicorn = uvicorn_server
         self._running_port = port
 
@@ -2076,6 +2080,20 @@ class VisualContextMCPBridge:
 
     @staticmethod
     def build_uvicorn_server(server: Any, host: str, port: int) -> Any:
+        if "logging.config" not in sys.modules:
+            import importlib
+
+            try:
+                importlib.import_module("logging.config")
+            except ImportError:
+                import types
+
+                log_cfg = types.ModuleType("logging.config")
+                log_cfg.__dict__["dictConfig"] = lambda *args, **kwargs: None
+                log_cfg.__dict__["fileConfig"] = lambda *args, **kwargs: None
+                sys.modules["logging.config"] = log_cfg
+                logging.__dict__["config"] = log_cfg
+
         import uvicorn  # type: ignore[import-not-found]  # ty: ignore[import-not-found]
 
         if hasattr(server, "streamable_http_app"):
@@ -2088,7 +2106,9 @@ class VisualContextMCPBridge:
         else:
             raise RuntimeError("Unsupported MCP server implementation")
 
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        config = uvicorn.Config(
+            app, host=host, port=port, log_level="warning", log_config=None
+        )
         return uvicorn.Server(config)
 
     @classmethod
