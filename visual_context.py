@@ -36,7 +36,9 @@ Algorithms:
 
 from __future__ import annotations
 
+import atexit
 import bisect
+import contextlib
 import csv
 import enum
 import gc
@@ -48,6 +50,7 @@ import math
 import operator
 import platform
 import re
+import subprocess  # ruff: ignore[suspicious-subprocess-import]
 import sys
 import tempfile
 import threading
@@ -65,7 +68,6 @@ from pupil_labs.neon_player.plugins.events import EventsPlugin
 from PySide6.QtCore import (
     QObject,
     QPointF,
-    QProcess,
     QRect,
     QRectF,
     Qt,
@@ -1932,24 +1934,31 @@ class _MacSayTTS:
     """Fallback TTS using macOS `/usr/bin/say` when `QtTextToSpeech` is absent."""
 
     def __init__(self) -> None:
-        self._proc: QProcess | None = None
+        self._proc: subprocess.Popen[bytes] | None = None
+        atexit.register(self.stop)
 
     def say(self, text: str) -> None:
         self.stop()
         if not text:
             return
-        proc = QProcess()
-        proc.start("/usr/bin/say", ["--", text])
-        self._proc = proc
+        try:
+            self._proc = subprocess.Popen(  # ruff: ignore[subprocess-without-shell-equals-true]
+                ["/usr/bin/say", "--", text],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            logger.debug("Failed to spawn /usr/bin/say", exc_info=True)
 
     def stop(self) -> None:
-        if (
-            self._proc is not None
-            and self._proc.state() != QProcess.ProcessState.NotRunning
-        ):
-            self._proc.terminate()
-            self._proc.waitForFinished(200)
+        proc = self._proc
         self._proc = None
+        if proc is not None and proc.poll() is None:
+            with contextlib.suppress(Exception):
+                proc.kill()
+
+    def __del__(self) -> None:
+        self.stop()
 
 
 class TTSController:
@@ -1958,6 +1967,7 @@ class TTSController:
     def __init__(self) -> None:
         self._backend: Any = self.init_backend()
         self._last_narrated_ns: int = -1
+        atexit.register(self.stop)
 
     @staticmethod
     def init_backend() -> Any:
@@ -1981,7 +1991,8 @@ class TTSController:
 
     def stop(self) -> None:
         if self._backend is not None and hasattr(self._backend, "stop"):
-            self._backend.stop()
+            with contextlib.suppress(Exception):
+                self._backend.stop()
 
     def reset(self) -> None:
         self._last_narrated_ns = -1
