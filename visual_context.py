@@ -718,8 +718,8 @@ class CaptionRenderer:
         escaped = html.escape(text)
         for kw in matching_keywords:
             escaped = re.sub(
-                rf"\\b({re.escape(html.escape(kw))})\\b",
-                rf'<span style="color: {hl_hex}; font-weight: bold;">\\1</span>',
+                rf"\b({re.escape(html.escape(kw))})\b",
+                rf'<span style="color: {hl_hex}; font-weight: bold;">\1</span>',
                 escaped,
                 flags=re.IGNORECASE,
             )
@@ -2939,7 +2939,7 @@ class VisualContextPlugin(Plugin):
             matching_keywords = [
                 kw
                 for kw in self._get_saw_keywords()
-                if re.search(rf"\\b{re.escape(kw)}\\b", text, re.IGNORECASE)
+                if re.search(rf"\b{re.escape(kw)}\b", text, re.IGNORECASE)
             ]
             CaptionRenderer.render_text(
                 painter,
@@ -2961,7 +2961,7 @@ def _keyword_event_timestamps(
     needle = keyword.strip()
     if not needle:
         return []
-    pattern = re.compile(rf"\\b{re.escape(needle)}\\b", re.IGNORECASE)
+    pattern = re.compile(rf"\b{re.escape(needle)}\b", re.IGNORECASE)
 
     timestamps: list[int] = []
     previous_matched = False
