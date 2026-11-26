@@ -2085,7 +2085,23 @@ class VisualContextMCPBridge:
             )
             return None
 
-        server = MCPServer("neon-visual-context")
+        instructions = (
+            "Visual Context MCP provides VLM scene captions and timeline event tools "
+            "for the loaded Neon recording. Captions include nanosecond timestamps "
+            "(`start_ns`, `end_ns`) and relative seconds (`start_s`, `end_s`). "
+            "To analyze eye-tracking metrics (pupil diameter, blinks, fixations, gaze, "
+            "eyelid, IMU) over caption intervals, call `get_plugin_status()` for "
+            "`recording_path`, then run a Python script with `pupil_labs.neon_recording` "
+            "(`uv run --with pupil-labs-neon-recording python ...`): "
+            "`rec = nr.load(recording_path)` exposes `rec.pupil` (`.time`, "
+            "`.diameter_left`, `.diameter_right`), `rec.blinks` (`.start_time`, "
+            "`.stop_time`), `rec.fixations`, `rec.gaze`, `rec.eyeball`, `rec.eyelid`, "
+            "and `rec.imu` (all timestamps in nanoseconds)."
+        )
+        try:
+            server = MCPServer("neon-visual-context", instructions=instructions)
+        except TypeError:
+            server = MCPServer("neon-visual-context")
         cls.register_mcp_tools(server, plugin)
         return server
 
@@ -2226,12 +2242,18 @@ class VisualContextMCPBridge:
 
         @server.tool()
         def get_plugin_status() -> dict[str, Any]:
-            """Get status of VisualContextPlugin, loaded recording, and settings."""
+            """Get status of VisualContextPlugin, loaded recording path/start time, and settings."""
 
             def _action() -> dict[str, Any]:
                 rec = plugin._safe_recording()
+                rec_dir = getattr(rec, "_rec_dir", None)
                 rec_name = getattr(rec, "name", None) or (
-                    rec._rec_dir.name if rec and hasattr(rec, "_rec_dir") else None
+                    rec_dir.name if rec_dir is not None else None
+                )
+                rec_path = str(rec_dir) if rec_dir is not None else None
+                rec_start_time = getattr(rec, "start_time", None)
+                rec_start_ns = (
+                    int(rec_start_time) if rec_start_time is not None else None
                 )
                 job = getattr(plugin, "job", None) or getattr(plugin, "_job", None)
                 is_running = (
@@ -2241,6 +2263,8 @@ class VisualContextMCPBridge:
                 return {
                     "recording_loaded": rec is not None,
                     "recording_name": rec_name,
+                    "recording_path": rec_path,
+                    "recording_start_time_ns": rec_start_ns,
                     "caption_count": len(plugin._captions),
                     "is_captioning_running": is_running,
                     "model": (
